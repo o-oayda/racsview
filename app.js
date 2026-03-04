@@ -2,12 +2,23 @@
 
 // CDS MocServer query endpoint (HiPS registry/aggregator)
 const MOCSERVER = "https://alasky.cds.unistra.fr/MocServer/query";
+const CASDA_TAP_SYNC = "https://casda.csiro.au/casda_vo_tools/tap/sync";
 
 // The two surveys you care about in the registry:
 const IDS = {
   low: "CSIRO/P/RACS/low/I",
   mid: "CSIRO/P/RACS/mid/I",
 };
+
+const CATALOG_TABLES = {
+  // CASDA RACS source-catalogue tables discovered via TAP_SCHEMA.
+  low: "AS110.racs_dr1_sources_galacticcut_v2021_08_v02",
+  mid: "AS110.racs_mid_sources_v01",
+};
+
+const CATALOG_LIMIT = 3000;
+const CATALOG_MIN_RADIUS_DEG = 0.2;
+const CATALOG_MAX_RADIUS_DEG = 2.0;
 
 const statusEl = document.getElementById("status");
 const setStatus = (s) => {
@@ -103,7 +114,14 @@ function makeSurveyFromRecord(rec) {
   });
 }
 
-const state = { recLow: null, recMid: null, surveyLow: null, surveyMid: null };
+const state = {
+  recLow: null,
+  recMid: null,
+  surveyLow: null,
+  surveyMid: null,
+  catLow: null,
+  catMid: null,
+};
 
 async function load(which) {
   const rec = which === "low" ? state.recLow : state.recMid;
@@ -130,13 +148,107 @@ async function load(which) {
   setStatus(`Showing: ${title}`);
 }
 
+function getTapConeFromView() {
+  const [ra, dec] = aladin.getRaDec();
+  const fov = aladin.getFoV();
+  const rawRadius = Math.min(fov[0], fov[1]) / 2;
+  const radiusDeg = Math.min(
+    CATALOG_MAX_RADIUS_DEG,
+    Math.max(CATALOG_MIN_RADIUS_DEG, rawRadius)
+  );
+  return { ra, dec, radiusDeg };
+}
+
+function buildTapSyncUrl(query) {
+  const url = new URL(CASDA_TAP_SYNC);
+  url.searchParams.set("REQUEST", "doQuery");
+  url.searchParams.set("LANG", "ADQL");
+  url.searchParams.set("FORMAT", "votable");
+  url.searchParams.set("QUERY", query);
+  return url.toString();
+}
+
+function buildRacsSourceQuery(table, ra, dec, radiusDeg, limit) {
+  const raStr = Number(ra).toFixed(6);
+  const decStr = Number(dec).toFixed(6);
+  const radStr = Number(radiusDeg).toFixed(6);
+  const lowerTable = String(table).toLowerCase();
+  const nameCol = lowerTable.includes("racs_dr1_sources") ? "source_name" : "name";
+  const totalFluxCol = lowerTable.includes("racs_dr1_sources")
+    ? "total_flux_source"
+    : "total_flux";
+
+  // Cone-limited query around the current view center to keep result volume manageable.
+  return [
+    `SELECT TOP ${limit} ra, dec, ${nameCol} AS name, ${totalFluxCol} AS total_flux, peak_flux`,
+    `FROM ${table}`,
+    `WHERE 1 = CONTAINS(`,
+    `  POINT('ICRS', ra, dec),`,
+    `  CIRCLE('ICRS', ${raStr}, ${decStr}, ${radStr})`,
+    `)`
+  ].join(" ");
+}
+
+function setCatalogButtonsDisabled(disabled) {
+  document.getElementById("btnLowCat").disabled = disabled;
+  document.getElementById("btnMidCat").disabled = disabled;
+}
+
+async function loadSourceCatalog(which) {
+  const table = which === "low" ? CATALOG_TABLES.low : CATALOG_TABLES.mid;
+  const label = which === "low" ? "RACS low sources" : "RACS mid sources";
+  const color = which === "low" ? "#f59e0b" : "#22c55e";
+  const stateKey = which === "low" ? "catLow" : "catMid";
+  const oldCatalog = state[stateKey];
+
+  const cone = getTapConeFromView();
+  const query = buildRacsSourceQuery(table, cone.ra, cone.dec, cone.radiusDeg, CATALOG_LIMIT);
+  const url = buildTapSyncUrl(query);
+
+  setCatalogButtonsDisabled(true);
+  setStatus(
+    `Querying ${label} (${CATALOG_LIMIT} max within ${cone.radiusDeg.toFixed(2)}°)...`
+  );
+
+  try {
+    const catalog = await new Promise((resolve, reject) => {
+      A.catalogFromURL(
+        url,
+        {
+          name: label,
+          color,
+          hoverColor: "#ff5555",
+          onClick: "showTable"
+        },
+        (loadedCatalog) => resolve(loadedCatalog),
+        (err) => reject(err),
+        true
+      );
+    });
+
+    if (oldCatalog && typeof oldCatalog.hide === "function") {
+      oldCatalog.hide();
+    }
+
+    state[stateKey] = catalog;
+    aladin.addCatalog(catalog);
+    setStatus(`Showing ${label} (${CATALOG_LIMIT} max, ${cone.radiusDeg.toFixed(2)}° cone)`);
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    setStatus(`Catalog load failed: ${message}`);
+  } finally {
+    setCatalogButtonsDisabled(false);
+  }
+}
+
 async function init() {
   // Aladin v3 must initialize WASM before creating a viewer.
   await A.init;
 
   // Create viewer after A.init resolves.
   aladin = A.aladin("#aladin", {
-    target: "0 +0",
+    target: "279.5 -31.7",
+    cooFrame: "GAL",
     fov: 6,
     showGotoControl: true,
     showLayersControl: true
@@ -155,6 +267,7 @@ async function init() {
   // Enable UI.
   document.getElementById("btnLow").disabled = false;
   document.getElementById("btnMid").disabled = false;
+  setCatalogButtonsDisabled(false);
 
   document.getElementById("btnLow").onclick = () => {
     load("low").catch((e) => setStatus(`Error: ${e.message}`));
@@ -162,9 +275,17 @@ async function init() {
   document.getElementById("btnMid").onclick = () => {
     load("mid").catch((e) => setStatus(`Error: ${e.message}`));
   };
+  document.getElementById("btnLowCat").onclick = () => {
+    loadSourceCatalog("low").catch((e) => setStatus(`Error: ${e.message}`));
+  };
+  document.getElementById("btnMidCat").onclick = () => {
+    loadSourceCatalog("mid").catch((e) => setStatus(`Error: ${e.message}`));
+  };
 
   // Start on low.
   await load("low");
+  aladin.setFrame("GAL");
+  aladin.gotoPosition(279.5, -31.7);
 }
 
 init().catch((e) => {

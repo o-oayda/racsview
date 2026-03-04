@@ -10,7 +10,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-firefox --new-window http://localhost:8000/ &
+firefox http://localhost:8000/ &
 
 # Keep script alive while the server runs; Ctrl+C will trigger cleanup.
 wait "$SERVER_PID"
