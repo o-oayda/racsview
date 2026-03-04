@@ -90,13 +90,16 @@ function makeSurveyFromRecord(rec) {
   const order = num(rec.hips_order, 8);
   const frame = toFrame(rec.hips_frame);
   const title = rec.obs_title || rec.ID || "HiPS";
+  const tileFormats = String(rec.hips_tile_format || "").toLowerCase();
+  const preferredFormat = tileFormats.includes("png") ? "png" : "fits";
 
   // Aladin v3 UMD API: construct an image HiPS layer from URL/metadata.
   return A.HiPS(url, {
     name: title,
     cooFrame: frame,
     maxOrder: order,
-    imgFormat: "fits"
+    // Prefer PNG for faster interactive rendering; use FITS when PNG is unavailable.
+    imgFormat: preferredFormat
   });
 }
 
