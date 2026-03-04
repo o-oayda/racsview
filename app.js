@@ -16,11 +16,11 @@ const CATALOG_TABLES = {
   mid: "AS110.racs_mid_sources_v01",
 };
 
-const CATALOG_LIMIT = 3000;
 const CATALOG_MIN_RADIUS_DEG = 0.2;
 const CATALOG_MAX_RADIUS_DEG = 2.0;
 
 const statusEl = document.getElementById("status");
+const minFluxEl = document.getElementById("minFlux");
 const setStatus = (s) => {
   statusEl.textContent = s;
 };
@@ -168,7 +168,15 @@ function buildTapSyncUrl(query) {
   return url.toString();
 }
 
-function buildRacsSourceQuery(table, ra, dec, radiusDeg, limit) {
+function getMinFluxFilterValue() {
+  const value = Number(minFluxEl.value);
+  if (!Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+  return value;
+}
+
+function buildRacsSourceQuery(table, ra, dec, radiusDeg, minFlux) {
   const raStr = Number(ra).toFixed(6);
   const decStr = Number(dec).toFixed(6);
   const radStr = Number(radiusDeg).toFixed(6);
@@ -177,15 +185,19 @@ function buildRacsSourceQuery(table, ra, dec, radiusDeg, limit) {
   const totalFluxCol = lowerTable.includes("racs_dr1_sources")
     ? "total_flux_source"
     : "total_flux";
+  const fluxWhere = Number.isFinite(minFlux)
+    ? `AND ${totalFluxCol} >= ${Number(minFlux).toFixed(6)}`
+    : "";
 
   // Cone-limited query around the current view center to keep result volume manageable.
   return [
-    `SELECT TOP ${limit} ra, dec, ${nameCol} AS name, ${totalFluxCol} AS total_flux, peak_flux`,
+    `SELECT ra, dec, ${nameCol} AS name, ${totalFluxCol} AS total_flux, peak_flux`,
     `FROM ${table}`,
     `WHERE 1 = CONTAINS(`,
     `  POINT('ICRS', ra, dec),`,
     `  CIRCLE('ICRS', ${raStr}, ${decStr}, ${radStr})`,
-    `)`
+    `)`,
+    fluxWhere
   ].join(" ");
 }
 
@@ -200,15 +212,15 @@ async function loadSourceCatalog(which) {
   const color = which === "low" ? "#f59e0b" : "#22c55e";
   const stateKey = which === "low" ? "catLow" : "catMid";
   const oldCatalog = state[stateKey];
+  const minFlux = getMinFluxFilterValue();
 
   const cone = getTapConeFromView();
-  const query = buildRacsSourceQuery(table, cone.ra, cone.dec, cone.radiusDeg, CATALOG_LIMIT);
+  const query = buildRacsSourceQuery(table, cone.ra, cone.dec, cone.radiusDeg, minFlux);
   const url = buildTapSyncUrl(query);
 
   setCatalogButtonsDisabled(true);
-  setStatus(
-    `Querying ${label} (${CATALOG_LIMIT} max within ${cone.radiusDeg.toFixed(2)}°)...`
-  );
+  const fluxText = minFlux === null ? "no flux cut" : `min flux ${minFlux} mJy`;
+  setStatus(`Querying ${label} (${fluxText}, ${cone.radiusDeg.toFixed(2)}° cone)...`);
 
   try {
     const catalog = await new Promise((resolve, reject) => {
@@ -232,7 +244,7 @@ async function loadSourceCatalog(which) {
 
     state[stateKey] = catalog;
     aladin.addCatalog(catalog);
-    setStatus(`Showing ${label} (${CATALOG_LIMIT} max, ${cone.radiusDeg.toFixed(2)}° cone)`);
+    setStatus(`Showing ${label} (${fluxText}, ${cone.radiusDeg.toFixed(2)}° cone)`);
   } catch (err) {
     const message = err && err.message ? err.message : String(err);
     setStatus(`Catalog load failed: ${message}`);
