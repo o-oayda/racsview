@@ -17,10 +17,11 @@ const CATALOG_TABLES = {
 };
 
 const CATALOG_MIN_RADIUS_DEG = 0.2;
-const CATALOG_MAX_RADIUS_DEG = 2.0;
+const CATALOG_MAX_RADIUS_DEG = 4.0;
 
 const statusEl = document.getElementById("status");
 const minFluxEl = document.getElementById("minFlux");
+const sourceSizeEl = document.getElementById("sourceSize");
 const setStatus = (s) => {
   statusEl.textContent = s;
 };
@@ -123,7 +124,8 @@ const state = {
   catMid: null,
 };
 
-async function load(which) {
+async function load(which, options = {}) {
+  const recenter = Boolean(options.recenter);
   const rec = which === "low" ? state.recLow : state.recMid;
   const survey = which === "low" ? state.surveyLow : state.surveyMid;
 
@@ -137,13 +139,15 @@ async function load(which) {
   // Set the base image layer to this HiPS survey.
   aladin.setBaseImageLayer(survey);
 
-  // Use registry-provided initial view if present.
-  const ra = num(rec.hips_initial_ra, 0);
-  const dec = num(rec.hips_initial_dec, 0);
-  const fov = num(rec.hips_initial_fov, 6);
-
-  aladin.gotoRaDec(ra, dec);
-  aladin.setFoV(fov);
+  // Only recenter when explicitly requested (e.g. initial startup).
+  // Keeping the current view preserves visible catalog overlays when switching surveys.
+  if (recenter) {
+    const ra = num(rec.hips_initial_ra, 0);
+    const dec = num(rec.hips_initial_dec, 0);
+    const fov = num(rec.hips_initial_fov, 6);
+    aladin.gotoRaDec(ra, dec);
+    aladin.setFoV(fov);
+  }
 
   setStatus(`Showing: ${title}`);
 }
@@ -174,6 +178,14 @@ function getMinFluxFilterValue() {
     return null;
   }
   return value;
+}
+
+function getSourceSizeValue() {
+  const value = Number(sourceSizeEl.value);
+  if (!Number.isFinite(value) || value < 1) {
+    return 8;
+  }
+  return Math.round(value);
 }
 
 function buildRacsSourceQuery(table, ra, dec, radiusDeg, minFlux) {
@@ -213,6 +225,7 @@ async function loadSourceCatalog(which) {
   const stateKey = which === "low" ? "catLow" : "catMid";
   const oldCatalog = state[stateKey];
   const minFlux = getMinFluxFilterValue();
+  const sourceSize = getSourceSizeValue();
 
   const cone = getTapConeFromView();
   const query = buildRacsSourceQuery(table, cone.ra, cone.dec, cone.radiusDeg, minFlux);
@@ -229,6 +242,7 @@ async function loadSourceCatalog(which) {
         {
           name: label,
           color,
+          sourceSize,
           hoverColor: "#ff5555",
           onClick: "showTable"
         },
@@ -295,7 +309,7 @@ async function init() {
   };
 
   // Start on low.
-  await load("low");
+  await load("low", { recenter: true });
   aladin.setFrame("GAL");
   aladin.gotoPosition(279.5, -31.7);
 }
