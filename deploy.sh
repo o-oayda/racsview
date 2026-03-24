@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-python3 -m http.server 8000 &
+python3 server.py 8000 &
 SERVER_PID=$!
 
 cleanup() {
@@ -10,7 +10,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-firefox http://localhost:8000/ &
+sleep 1
+open -a Firefox http://localhost:8000/
 
 # Keep script alive while the server runs; Ctrl+C will trigger cleanup.
 wait "$SERVER_PID"
