@@ -6,27 +6,45 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-    #bar { display:flex; gap:10px; align-items:center; padding:10px 12px; border-bottom:1px solid #ddd; }
-    #bar button { padding:6px 10px; }
-    #status { margin-left:auto; opacity:0.8; font-size: 14px; }
-    #aladin { width: 100vw; height: calc(100vh - 52px); }
-    code { font-size: 13px; }
+    #bar { display:flex; gap:10px; align-items:center; padding:8px 12px; border-bottom:1px solid #ddd; flex-wrap: wrap; font-size: 13px; }
+    #bar button { padding:5px 9px; font-size: 13px; }
+    #bar select { padding:3px 5px; font-size: 13px; }
+    #bar input { font-size: 13px; }
+    #status { margin-left:auto; opacity:0.8; }
+    .sep { width:1px; height:24px; background:#ccc; }
+    #aladin { width: 100vw; height: calc(100vh - 42px); position: relative; }
   </style>
 </head>
 <body>
   <div id="bar">
     <strong>RACS</strong>
-    <button id="btnLow" disabled>Load low (887.5 MHz)</button>
-    <button id="btnMid" disabled>Load mid (1367.5 MHz)</button>
-    <button id="btnLowCat" disabled>Load low sources</button>
-    <button id="btnMidCat" disabled>Load mid sources</button>
-    <label for="minFlux" style="font-size: 13px;">Min total flux (mJy)</label>
-    <input id="minFlux" type="number" min="0" step="0.1" value="0" style="width: 96px; padding: 4px 6px;" />
-    <label for="sourceSize" style="font-size: 13px;">Source size</label>
-    <input id="sourceSize" type="number" min="1" step="1" value="8" style="width: 64px; padding: 4px 6px;" />
+    <button id="btnLoadImg" disabled>Load images</button>
+    <select id="selImage" disabled>
+      <option value="low">RACS-low (887.5 MHz)</option>
+      <option value="mid">RACS-mid (1367.5 MHz)</option>
+    </select>
+    <div class="sep"></div>
+    <button id="btnLoadSrc" disabled>Load sources</button>
+    <select id="selCatalogue" disabled>
+      <option value="">Select catalogue…</option>
+    </select>
+    <button id="btnConfigData">Set datastore</button>
+    <label>Min flux (mJy)</label>
+    <input id="minFlux" type="number" min="0" step="0.1" value="0" style="width: 72px;" />
+    <label>Src size</label>
+    <input id="sourceSize" type="number" min="1" step="1" value="8" style="width: 48px;" />
+    <div class="sep"></div>
+    <button id="btnCircle">Circle: OFF</button>
+    <label>r (°)</label>
+    <input id="circleRadius" type="number" min="0.01" step="0.1" value="1.0" style="width: 60px;" />
+    <div class="sep"></div>
+    <button id="btnGrid">Grid: OFF</button>
+    <label>nside</label>
+    <input id="gridNside" type="number" min="1" step="1" value="64" style="width: 52px;" />
     <span id="status">Initializing…</span>
   </div>
-  <div id="aladin"></div>
+  <div id="aladin">
+  </div>
 
   <script src="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js" charset="utf-8"></script>
   <script src="./app.js"></script>
