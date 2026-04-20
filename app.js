@@ -7,6 +7,18 @@ const MOCSERVER = "https://alasky.cds.unistra.fr/MocServer/query";
 const IDS = {
   low: "CSIRO/P/RACS/low/I",
   mid: "CSIRO/P/RACS/mid/I",
+  // RACS-high is not in CDS registry; loaded directly from ATNF
+};
+
+// Direct HiPS definitions (not in CDS MocServer — proxied through server.py)
+const DIRECT_HIPS = {
+  high: {
+    url: "/proxy/hips/RACShigh1_I1",
+    name: "RACS-high (1655.5 MHz)",
+    cooFrame: "equatorial",
+    maxOrder: 9,
+    imgFormat: "png",
+  },
 };
 
 const CATALOG_MIN_RADIUS_DEG = 0.2;
@@ -544,6 +556,21 @@ async function init() {
   state.records.mid = recMid;
   state.surveys.low = makeSurveyFromRecord(recLow);
   state.surveys.mid = makeSurveyFromRecord(recMid);
+
+  // RACS-high: loaded directly from ATNF (not in CDS MocServer)
+  state.records.high = {
+    obs_title: "RACS-high (1655.5 MHz)",
+    ID: "RACS-high",
+    dataproduct_type: "image",
+    hips_service_url: DIRECT_HIPS.high.url,
+    hips_frame: "equatorial",
+    hips_order: DIRECT_HIPS.high.maxOrder,
+    hips_tile_format: "png",
+    hips_initial_ra: 180,
+    hips_initial_dec: -30,
+    hips_initial_fov: 6,
+  };
+  state.surveys.high = makeSurveyFromRecord(state.records.high);
 
   populateCatalogueDropdown();
 

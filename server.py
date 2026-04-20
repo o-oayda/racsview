@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import urllib.parse
+import urllib.request
 
 # Config: path to catalogue files (set this env var to point to your local copy of the data)
 DATASTORE = os.environ.get(
@@ -194,6 +195,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._handle_sources(parsed.query)
         elif parsed.path == "/api/healpix/grid":
             self._handle_healpix_grid(parsed.query)
+        elif parsed.path.startswith("/proxy/hips/"):
+            self._handle_hips_proxy(parsed.path)
         else:
             super().do_GET()
 
@@ -320,6 +323,47 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             })
 
         self._send_json(result)
+
+    # Allowed remote HiPS base URLs for proxying
+    PROXY_ALLOWED = {
+        "RACShigh1_I1": "https://www.atnf.csiro.au/research/RACS/RACShigh1_I1",
+    }
+
+    def _handle_hips_proxy(self, path):
+        """Reverse-proxy HiPS tile requests to bypass CORS restrictions.
+
+        URL pattern: /proxy/hips/<key>/<remainder>
+        e.g. /proxy/hips/RACShigh1_I1/properties
+             /proxy/hips/RACShigh1_I1/Norder3/Dir0/Npix300.png
+        """
+        parts = path.split("/", 4)  # ['', 'proxy', 'hips', key, remainder]
+        if len(parts) < 5:
+            self.send_error(400, "Bad proxy path")
+            return
+        key = parts[3]
+        remainder = parts[4]
+
+        base_url = self.PROXY_ALLOWED.get(key)
+        if not base_url:
+            self.send_error(403, f"Unknown HiPS key: {key}")
+            return
+
+        remote_url = f"{base_url}/{remainder}"
+        try:
+            req = urllib.request.Request(remote_url)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+                content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data)
+        except urllib.error.HTTPError as e:
+            self.send_error(e.code, str(e.reason))
+        except Exception as e:
+            self.send_error(502, f"Proxy error: {e}")
 
     def log_message(self, format, *args):
         # Quieter logging
