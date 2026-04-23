@@ -1,0 +1,12 @@
+[project]
+name = "racsview"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "astropy>=7.2.0",
+    "fitsio>=1.3.0",
+    "healpy>=1.19.0",
+    "numpy>=2.4.3",
+]

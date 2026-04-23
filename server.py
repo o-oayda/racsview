@@ -4,65 +4,256 @@ import http.server
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
 
-# Config: path to catalogue files (set this env var to point to your local copy of the data)
-DATASTORE = os.environ.get(
-    "RACSVIEW_DATASTORE", "/Users/mali/repos/datastore"
-)
+SUPPORTED_CATALOGUE_EXTENSIONS = (".fits", ".csv", ".dat")
 
 # Catalogue definitions (mirrors SHORTHAND_CATALOGUES from strykowski-lab/dipoletools)
 CATALOGUES = {
     "racs-low1": {
-        "file": "RACS-low1_sources_25arcsec.csv",
+        "basename": "RACS-low1_sources_25arcsec.csv",
         "ra": "ra", "dec": "dec", "flux": "total_flux_source", "id": "source_id",
     },
     "racs-low2-25": {
-        "file": "RACS-low2_sources_25arcsec_patched.fits",
+        "basename": "RACS-low2_sources_25arcsec_patched.fits",
         "ra": "RA", "dec": "Dec", "flux": "Total_flux", "id": "Source_ID",
     },
     "racs-low2-45": {
-        "file": "RACS-low2_sources_45arcsec_patched.fits",
+        "basename": "RACS-low2_sources_45arcsec_patched.fits",
         "ra": "RA", "dec": "Dec", "flux": "Total_flux", "id": "Source_ID",
     },
     "racs-low3": {
-        "file": "RACS-low3_sources.fits",
+        "basename": "RACS-low3_sources.fits",
         "ra": "RA", "dec": "Dec", "flux": "Total_flux", "id": "Source_ID",
     },
     "racs-low3-scaled": {
-        "file": "RACS-low3_sources_scaled.fits",
+        "basename": "RACS-low3_sources_scaled.fits",
         "ra": "RA", "dec": "Dec", "flux": "Total_flux", "id": "Source_ID",
     },
     "racs-mid1-25": {
-        "file": "RACS-mid_sources_25arcsec.fits",
+        "basename": "RACS-mid_sources_25arcsec.fits",
         "ra": "ra", "dec": "dec", "flux": "total_flux", "id": "id",
     },
     "racs-mid1-45": {
-        "file": "RACS-mid_sources_45arcsec.fits",
+        "basename": "RACS-mid_sources_45arcsec.fits",
         "ra": "RA", "dec": "Dec", "flux": "Total_flux", "id": "Source_ID",
     },
     "racs-high": {
-        "file": "RACS-high_sources.fits",
+        "basename": "RACS-high_sources.fits",
         "ra": "ra", "dec": "dec", "flux": "total_flux", "id": "id",
     },
     "nvss": {
-        "file": "full_NVSS_combined_named.dat",
+        "basename": "full_NVSS_combined_named.dat",
         "ra": "ra", "dec": "dec", "flux": "integrated_flux", "id": "source_name",
     },
     "catwise": {
-        "file": "catwise_agns.fits",
+        "basename": "catwise_agns.fits",
         "ra": "ra", "dec": "dec", "flux": "w1", "id": "source_id",
     },
     "local": {
-        "file": "local_sources_ned_2mrs.csv",
+        "basename": "local_sources_ned_2mrs.csv",
         "ra": "ra", "dec": "dec", "flux": None, "id": "LS_id",
     },
 }
 
 # In-memory cache: catalogue name -> list of dicts
 _cache = {}
+_datastore_root = None
+_datastore_error = None
+_catalogue_resolution = {}
+
+
+class CatalogueResolutionError(Exception):
+    """Raised when a catalogue cannot be resolved to a usable file."""
+
+    def __init__(self, resolution):
+        self.resolution = resolution
+        super().__init__(resolution["message"])
+
+
+def _get_datastore_root():
+    """Resolve RACSVIEW_DATASTORE to an absolute directory path."""
+    raw_path = os.environ.get("RACSVIEW_DATASTORE")
+    if not raw_path:
+        return None, "RACSVIEW_DATASTORE is not set"
+
+    path = os.path.abspath(os.path.expanduser(raw_path))
+    if not os.path.exists(path):
+        return None, f"RACSVIEW_DATASTORE does not exist: {path}"
+    if not os.path.isdir(path):
+        return None, f"RACSVIEW_DATASTORE is not a directory: {path}"
+    return path, None
+
+
+def _set_datastore_root(path):
+    """Apply a new datastore root for the current server process."""
+    global _datastore_root, _datastore_error, _cache
+
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        _datastore_root = None
+        _datastore_error = "RACSVIEW_DATASTORE is not set"
+        _cache = {}
+        _resolve_catalogues()
+        return False, _datastore_error
+
+    os.environ["RACSVIEW_DATASTORE"] = raw_path
+    _datastore_root, _datastore_error = _get_datastore_root()
+    _cache = {}
+    _resolve_catalogues()
+    return _datastore_error is None, _datastore_error
+
+
+def _pick_directory_dialog():
+    """Open a native directory picker on the local machine running the server."""
+    if sys.platform == "darwin":
+        script = (
+            'set selectedFolder to choose folder with prompt "Select the racsview datastore directory"\n'
+            'POSIX path of selectedFolder'
+        )
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip(), None
+        return None, "Directory selection cancelled"
+
+    if sys.platform.startswith("linux"):
+        candidates = [
+            ["zenity", "--file-selection", "--directory", "--title=Select racsview datastore"],
+            ["qarma", "--file-selection", "--directory", "--title=Select racsview datastore"],
+            ["kdialog", "--getexistingdirectory", os.path.expanduser("~"), "Select racsview datastore"],
+        ]
+        for command in candidates:
+            if shutil.which(command[0]) is None:
+                continue
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                return result.stdout.strip(), None
+            return None, "Directory selection cancelled"
+        return None, "No supported native directory picker found"
+
+    if sys.platform.startswith("win"):
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            '$dialog.Description = "Select the racsview datastore directory"; '
+            "if ($dialog.ShowDialog() -eq 'OK') { Write-Output $dialog.SelectedPath }"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip(), None
+        return None, "Directory selection cancelled"
+
+    return None, f"Native directory picker is not supported on platform: {sys.platform}"
+
+
+def _scan_datastore(root):
+    """Return basename -> matching absolute paths for supported catalogue files."""
+    index = {}
+    for dirpath, _, filenames in os.walk(root):
+        for filename in filenames:
+            if not filename.lower().endswith(SUPPORTED_CATALOGUE_EXTENSIONS):
+                continue
+            path = os.path.join(dirpath, filename)
+            index.setdefault(filename, []).append(path)
+    return index
+
+
+def _make_resolution(name, cfg, status, *, path=None, matches=None, message=""):
+    return {
+        "name": name,
+        "basename": cfg["basename"],
+        "available": status == "ok",
+        "status": status,
+        "path": path,
+        "matches": matches or [],
+        "message": message,
+    }
+
+
+def _resolve_catalogues():
+    """Build catalogue resolution state from the configured datastore root."""
+    global _catalogue_resolution
+
+    if _datastore_error:
+        _catalogue_resolution = {
+            name: _make_resolution(name, cfg, "misconfigured", message=_datastore_error)
+            for name, cfg in CATALOGUES.items()
+        }
+        return
+
+    index = _scan_datastore(_datastore_root)
+    resolution = {}
+    for name, cfg in CATALOGUES.items():
+        matches = sorted(index.get(cfg["basename"], []))
+        if not matches:
+            resolution[name] = _make_resolution(
+                name,
+                cfg,
+                "missing",
+                message=f"Canonical file not found under datastore root: {cfg['basename']}",
+            )
+        elif len(matches) > 1:
+            resolution[name] = _make_resolution(
+                name,
+                cfg,
+                "ambiguous",
+                matches=matches,
+                message=f"Multiple matching files found for {cfg['basename']}",
+            )
+        else:
+            resolution[name] = _make_resolution(
+                name,
+                cfg,
+                "ok",
+                path=matches[0],
+                matches=matches,
+                message="resolved",
+            )
+    _catalogue_resolution = resolution
+
+
+def _get_catalogue_resolution(name):
+    resolution = _catalogue_resolution.get(name)
+    if resolution is None:
+        raise KeyError(f"Unknown catalogue: {name}")
+    return resolution
+
+
+def _print_catalogue_summary():
+    print(f"Datastore: {_datastore_root or '(unconfigured)'}")
+    if _datastore_error:
+        print(f"Datastore status: {_datastore_error}")
+    else:
+        indexed_paths = set()
+        for resolution in _catalogue_resolution.values():
+            indexed_paths.update(resolution["matches"])
+        print(
+            f"Scanned {len(indexed_paths)} supported files "
+            f"({', '.join(SUPPORTED_CATALOGUE_EXTENSIONS)})"
+        )
+
+    for name, resolution in _catalogue_resolution.items():
+        if resolution["status"] == "ok":
+            detail = resolution["path"]
+        elif resolution["status"] == "ambiguous":
+            detail = f"{len(resolution['matches'])} matches"
+        else:
+            detail = resolution["message"]
+        print(f"  {name}: {resolution['status']} -> {detail}")
 
 
 def _load_catalogue(name):
@@ -70,11 +261,12 @@ def _load_catalogue(name):
     if name in _cache:
         return _cache[name]
 
-    cfg = CATALOGUES[name]
-    path = os.path.join(DATASTORE, cfg["file"])
+    resolution = _get_catalogue_resolution(name)
+    if resolution["status"] != "ok":
+        raise CatalogueResolutionError(resolution)
 
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Catalogue file not found: {path}")
+    cfg = CATALOGUES[name]
+    path = resolution["path"]
 
     ext = os.path.splitext(path)[1].lower()
     rows = []
@@ -156,7 +348,7 @@ def _load_catalogue(name):
                 sid = str(row.get(id_col, ""))
                 rows.append({"ra": ra, "dec": dec, "flux": flux, "id": sid})
 
-    print(f"  Loaded {name}: {len(rows)} sources from {cfg['file']}")
+    print(f"  Loaded {name}: {len(rows)} sources from {path}")
     _cache[name] = rows
     return rows
 
@@ -200,6 +392,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         else:
             super().do_GET()
 
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/config/datastore":
+            self._handle_set_datastore()
+            return
+        if parsed.path == "/api/config/datastore/pick":
+            self._handle_pick_datastore()
+            return
+        self.send_error(404)
+
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode("utf-8")
         self.send_response(status)
@@ -209,14 +411,23 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_json_body(self):
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        return json.loads(raw.decode("utf-8"))
+
     def _handle_list_catalogues(self):
         cats = []
         for name, cfg in CATALOGUES.items():
-            path = os.path.join(DATASTORE, cfg["file"])
+            resolution = _get_catalogue_resolution(name)
             cats.append({
                 "name": name,
-                "file": cfg["file"],
-                "available": os.path.isfile(path),
+                "basename": cfg["basename"],
+                "available": resolution["available"],
+                "status": resolution["status"],
+                "path": resolution["path"],
+                "matches": resolution["matches"],
+                "message": resolution["message"],
             })
         self._send_json(cats)
 
@@ -248,10 +459,35 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             except (ValueError, TypeError):
                 min_flux = None
 
+        resolution = _get_catalogue_resolution(cat_name)
+        if resolution["status"] == "missing":
+            self._send_json({"error": resolution["message"]}, 404)
+            return
+        if resolution["status"] == "ambiguous":
+            self._send_json(
+                {
+                    "error": resolution["message"],
+                    "matches": resolution["matches"],
+                },
+                409,
+            )
+            return
+        if resolution["status"] == "misconfigured":
+            self._send_json({"error": resolution["message"]}, 500)
+            return
+
         try:
             rows = _load_catalogue(cat_name)
-        except FileNotFoundError as e:
-            self._send_json({"error": str(e)}, 404)
+        except CatalogueResolutionError as e:
+            status = {
+                "missing": 404,
+                "ambiguous": 409,
+                "misconfigured": 500,
+            }.get(e.resolution["status"], 500)
+            payload = {"error": e.resolution["message"]}
+            if e.resolution["matches"]:
+                payload["matches"] = e.resolution["matches"]
+            self._send_json(payload, status)
             return
         except Exception as e:
             self._send_json({"error": f"Failed to load catalogue: {e}"}, 500)
@@ -264,6 +500,62 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             "count": len(results),
             "sources": results,
         })
+
+    def _handle_set_datastore(self):
+        try:
+            body = self._read_json_body()
+        except json.JSONDecodeError:
+            self._send_json({"error": "Request body must be valid JSON"}, 400)
+            return
+
+        path = body.get("path")
+        ok, error = _set_datastore_root(path)
+        if not ok:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": error,
+                    "datastore": _datastore_root,
+                },
+                400,
+            )
+            return
+
+        print("Datastore updated via UI.")
+        _print_catalogue_summary()
+        self._send_json(
+            {
+                "ok": True,
+                "datastore": _datastore_root,
+            }
+        )
+
+    def _handle_pick_datastore(self):
+        path, error = _pick_directory_dialog()
+        if path is None:
+            self._send_json({"ok": False, "error": error}, 400)
+            return
+
+        ok, config_error = _set_datastore_root(path)
+        if not ok:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": config_error,
+                    "datastore": _datastore_root,
+                },
+                400,
+            )
+            return
+
+        print("Datastore updated via native picker.")
+        _print_catalogue_summary()
+        self._send_json(
+            {
+                "ok": True,
+                "datastore": _datastore_root,
+            }
+        )
 
     def _handle_healpix_grid(self, query_string):
         import healpy as hp
@@ -371,11 +663,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 
 def main():
+    global _datastore_root, _datastore_error
+
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    _datastore_root, _datastore_error = _get_datastore_root()
+    _resolve_catalogues()
     server = http.server.HTTPServer(("", port), Handler)
     print(f"racsview server on http://localhost:{port}")
-    print(f"Datastore: {DATASTORE}")
+    _print_catalogue_summary()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

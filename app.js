@@ -38,6 +38,7 @@ const selImageEl = document.getElementById("selImage");
 const selCatalogueEl = document.getElementById("selCatalogue");
 const btnLoadImgEl = document.getElementById("btnLoadImg");
 const btnLoadSrcEl = document.getElementById("btnLoadSrc");
+const btnConfigDataEl = document.getElementById("btnConfigData");
 const btnCircleEl = document.getElementById("btnCircle");
 const circleRadiusEl = document.getElementById("circleRadius");
 const btnGridEl = document.getElementById("btnGrid");
@@ -231,6 +232,29 @@ const state = {
   currentCat: null,
 };
 
+function setSourceControlsEnabled(enabled) {
+  btnLoadSrcEl.disabled = !enabled;
+  selCatalogueEl.disabled = !enabled;
+}
+
+async function pickDatastoreDirectory() {
+  btnConfigDataEl.disabled = true;
+  setStatus("Waiting for datastore directory selection…");
+  try {
+    const resp = await fetch("/api/config/datastore/pick", { method: "POST" });
+    const payload = await resp.json().catch(() => ({}));
+    if (!resp.ok || !payload.ok) {
+      throw new Error(payload.error || `HTTP ${resp.status}`);
+    }
+    setStatus(`Datastore configured: ${payload.datastore}`);
+    await populateCatalogueDropdown();
+  } catch (err) {
+    setStatus(`Datastore configuration failed: ${err.message || err}`);
+  } finally {
+    btnConfigDataEl.disabled = false;
+  }
+}
+
 // ===========================================================================
 // Image loading
 // ===========================================================================
@@ -354,6 +378,8 @@ async function populateCatalogueDropdown() {
     const resp = await fetch("/api/catalogues");
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const cats = await resp.json();
+    const misconfigured = cats.every((cat) => cat.status === "misconfigured");
+    const availableCats = cats.filter((cat) => cat.available);
 
     selCatalogueEl.innerHTML = "";
     const placeholder = document.createElement("option");
@@ -363,33 +389,31 @@ async function populateCatalogueDropdown() {
     placeholder.selected = true;
     selCatalogueEl.appendChild(placeholder);
 
-    for (const cat of cats) {
-      if (!cat.available) continue;
+    for (const cat of availableCats) {
       const opt = document.createElement("option");
       opt.value = cat.name;
       opt.textContent = cat.name;
       selCatalogueEl.appendChild(opt);
     }
-    selCatalogueEl.disabled = false;
+    setSourceControlsEnabled(availableCats.length > 0);
+
+    if (misconfigured) {
+      const message = cats[0] && cats[0].message
+        ? cats[0].message
+        : "Datastore is not configured.";
+      setStatus(`${message} Click "Set datastore" to choose a directory.`);
+    } else if (availableCats.length === 0) {
+      setStatus("No source catalogues were discovered under the configured datastore.");
+    }
   } catch (err) {
     console.error("Failed to load catalogue list:", err);
-    const names = [
-      "racs-low1", "racs-low2-25", "racs-low2-45",
-      "racs-low3", "racs-low3-scaled",
-      "racs-mid1-25", "racs-mid1-45", "racs-high",
-      "nvss", "catwise", "local"
-    ];
     selCatalogueEl.innerHTML = "";
     const ph = document.createElement("option");
     ph.value = ""; ph.textContent = "Select catalogue…";
     ph.disabled = true; ph.selected = true;
     selCatalogueEl.appendChild(ph);
-    for (const name of names) {
-      const opt = document.createElement("option");
-      opt.value = name; opt.textContent = name;
-      selCatalogueEl.appendChild(opt);
-    }
-    selCatalogueEl.disabled = false;
+    setSourceControlsEnabled(false);
+    setStatus("Failed to load catalogue list.");
   }
 }
 
@@ -577,7 +601,7 @@ async function init() {
   // Enable UI
   btnLoadImgEl.disabled = false;
   selImageEl.disabled = false;
-  btnLoadSrcEl.disabled = false;
+  setSourceControlsEnabled(false);
 
   // --- Image button ---
   btnLoadImgEl.onclick = () => {
@@ -589,6 +613,11 @@ async function init() {
     const cat = selCatalogueEl.value;
     if (!cat) { setStatus("Please select a catalogue first."); return; }
     loadLocalSources(cat).catch((e) => setStatus(`Error: ${e.message}`));
+  };
+  btnConfigDataEl.onclick = () => {
+    pickDatastoreDirectory().catch((e) => {
+      setStatus(`Datastore configuration failed: ${e.message || e}`);
+    });
   };
 
   // --- Circle toggle ---
