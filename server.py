@@ -15,7 +15,7 @@ SUPPORTED_CATALOGUE_EXTENSIONS = (".fits", ".csv", ".dat")
 # Catalogue definitions (mirrors SHORTHAND_CATALOGUES from strykowski-lab/dipoletools)
 CATALOGUES = {
     "racs-low1": {
-        "basename": "RACS-low1_sources_25arcsec.csv",
+        "basename": "RACS-low1_sources_25arcsec_allsources.fits",
         "ra": "ra", "dec": "dec", "flux": "total_flux_source", "id": "source_id",
     },
     "racs-low2-25": {
@@ -36,7 +36,7 @@ CATALOGUES = {
     },
     "racs-mid1-25": {
         "basename": "RACS-mid_sources_25arcsec.fits",
-        "ra": "ra", "dec": "dec", "flux": "total_flux", "id": "id",
+        "ra": "ra", "dec": "dec", "flux": "total_flux", "id": "source_id",
     },
     "racs-mid1-45": {
         "basename": "RACS-mid_sources_45arcsec.fits",
@@ -44,7 +44,7 @@ CATALOGUES = {
     },
     "racs-high": {
         "basename": "RACS-high_sources.fits",
-        "ra": "ra", "dec": "dec", "flux": "total_flux", "id": "id",
+        "ra": "ra", "dec": "dec", "flux": "total_flux", "id": "source_id",
     },
     "nvss": {
         "basename": "full_NVSS_combined_named.dat",
@@ -319,15 +319,33 @@ def _load_catalogue(name):
                 if "\t" in sample:
                     reader = csv.DictReader(f, delimiter="\t")
                 else:
-                    # whitespace delimited - use split
+                    # whitespace delimited; merge tokens spanning a quoted field
                     f.seek(0)
                     header_line = f.readline().strip()
                     headers = header_line.split()
+                    n_expected = len(headers)
                     reader = []
                     for line in f:
-                        vals = line.strip().split()
-                        if len(vals) == len(headers):
-                            reader.append(dict(zip(headers, vals)))
+                        parts = line.split()
+                        if len(parts) > n_expected:
+                            # Merge tokens between unbalanced double quotes into one field
+                            merged = []
+                            buf = None
+                            for tok in parts:
+                                if buf is not None:
+                                    buf.append(tok)
+                                    if tok.endswith('"'):
+                                        merged.append(" ".join(buf).strip('"'))
+                                        buf = None
+                                elif tok.startswith('"') and not tok.endswith('"'):
+                                    buf = [tok]
+                                else:
+                                    merged.append(tok.strip('"'))
+                            if buf is not None:
+                                merged.append(" ".join(buf).strip('"'))
+                            parts = merged
+                        if len(parts) == n_expected:
+                            reader.append(dict(zip(headers, parts)))
 
             ra_col = cfg["ra"]
             dec_col = cfg["dec"]
