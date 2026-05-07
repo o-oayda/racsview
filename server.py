@@ -11,14 +11,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-RACS_LOW3_HIPS_BASE_URL = "https://www.atnf.csiro.au/research/RACS/RACSlow3_I1/"
-
 SUPPORTED_CATALOGUE_EXTENSIONS = (".fits", ".csv", ".dat")
 
 # Catalogue definitions (mirrors SHORTHAND_CATALOGUES from strykowski-lab/dipoletools)
 CATALOGUES = {
     "racs-low1": {
-        "basename": "RACS-low1_sources_25arcsec.csv",
+        "basename": "RACS-low1_sources_25arcsec_allsources.fits",
         "ra": "ra", "dec": "dec", "flux": "total_flux_source", "id": "source_id",
     },
     "racs-low2-25": {
@@ -39,7 +37,7 @@ CATALOGUES = {
     },
     "racs-mid1-25": {
         "basename": "RACS-mid_sources_25arcsec.fits",
-        "ra": "ra", "dec": "dec", "flux": "total_flux", "id": "id",
+        "ra": "ra", "dec": "dec", "flux": "total_flux", "id": "source_id",
     },
     "racs-mid1-45": {
         "basename": "RACS-mid_sources_45arcsec.fits",
@@ -47,7 +45,7 @@ CATALOGUES = {
     },
     "racs-high": {
         "basename": "RACS-high_sources.fits",
-        "ra": "ra", "dec": "dec", "flux": "total_flux", "id": "id",
+        "ra": "ra", "dec": "dec", "flux": "total_flux", "id": "source_id",
     },
     "nvss": {
         "basename": "full_NVSS_combined_named.dat",
@@ -322,15 +320,33 @@ def _load_catalogue(name):
                 if "\t" in sample:
                     reader = csv.DictReader(f, delimiter="\t")
                 else:
-                    # whitespace delimited - use split
+                    # whitespace delimited; merge tokens spanning a quoted field
                     f.seek(0)
                     header_line = f.readline().strip()
                     headers = header_line.split()
+                    n_expected = len(headers)
                     reader = []
                     for line in f:
-                        vals = line.strip().split()
-                        if len(vals) == len(headers):
-                            reader.append(dict(zip(headers, vals)))
+                        parts = line.split()
+                        if len(parts) > n_expected:
+                            # Merge tokens between unbalanced double quotes into one field
+                            merged = []
+                            buf = None
+                            for tok in parts:
+                                if buf is not None:
+                                    buf.append(tok)
+                                    if tok.endswith('"'):
+                                        merged.append(" ".join(buf).strip('"'))
+                                        buf = None
+                                elif tok.startswith('"') and not tok.endswith('"'):
+                                    buf = [tok]
+                                else:
+                                    merged.append(tok.strip('"'))
+                            if buf is not None:
+                                merged.append(" ".join(buf).strip('"'))
+                            parts = merged
+                        if len(parts) == n_expected:
+                            reader.append(dict(zip(headers, parts)))
 
             ra_col = cfg["ra"]
             dec_col = cfg["dec"]
@@ -381,6 +397,12 @@ def _cone_search(rows, ra_center, dec_center, radius_deg, min_flux=None):
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    # Allowed remote HiPS base URLs for proxying.
+    PROXY_ALLOWED = {
+        "RACShigh1_I1": "https://www.atnf.csiro.au/research/RACS/RACShigh1_I1",
+        "RACSlow3_I1": "https://www.atnf.csiro.au/research/RACS/RACSlow3_I1",
+    }
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
 
@@ -390,8 +412,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._handle_sources(parsed.query)
         elif parsed.path == "/api/healpix/grid":
             self._handle_healpix_grid(parsed.query)
-        elif parsed.path.startswith("/api/hips/racs-low3/"):
-            self._handle_racslow3_hips_proxy(parsed)
+        elif parsed.path.startswith("/proxy/hips/"):
+            self._handle_hips_proxy(parsed)
         else:
             super().do_GET()
 
@@ -619,55 +641,49 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         self._send_json(result)
 
-    def _handle_racslow3_hips_proxy(self, parsed):
-        prefix = "/api/hips/racs-low3/"
-        rel_path = parsed.path[len(prefix):]
-        rel_path = rel_path.lstrip("/")
-        target_url = urllib.parse.urljoin(RACS_LOW3_HIPS_BASE_URL, rel_path)
+    def _handle_hips_proxy(self, parsed):
+        """Reverse-proxy HiPS tile requests to bypass CORS restrictions.
+
+        URL pattern: /proxy/hips/<key>/<remainder>
+        e.g. /proxy/hips/RACShigh1_I1/properties
+             /proxy/hips/RACShigh1_I1/Norder3/Dir0/Npix300.png
+        """
+        parts = parsed.path.split("/", 4)  # ['', 'proxy', 'hips', key, remainder]
+        if len(parts) < 5:
+            self.send_error(400, "Bad proxy path")
+            return
+        key = parts[3]
+        remainder = parts[4].lstrip("/")
+
+        base_url = self.PROXY_ALLOWED.get(key)
+        if not base_url:
+            self.send_error(403, f"Unknown HiPS key: {key}")
+            return
+
+        remote_url = f"{base_url}/{remainder}" if remainder else base_url
         if parsed.query:
-            target_url = f"{target_url}?{parsed.query}"
-
-        request = urllib.request.Request(
-            target_url,
-            headers={
-                "User-Agent": "racsview/1.0",
-            },
-        )
-
+            remote_url = f"{remote_url}?{parsed.query}"
         try:
-            with urllib.request.urlopen(request) as response:
-                body = response.read()
-                content_type = response.headers.get_content_type()
-                content_length = response.headers.get("Content-Length")
-                cache_control = response.headers.get("Cache-Control")
-
-                self.send_response(response.status)
+            req = urllib.request.Request(
+                remote_url,
+                headers={"User-Agent": "racsview/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+                content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                self.send_response(resp.status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Access-Control-Allow-Origin", "*")
-                if content_length:
-                    self.send_header("Content-Length", content_length)
+                self.send_header("Content-Length", str(len(data)))
+                cache_control = resp.headers.get("Cache-Control")
                 if cache_control:
                     self.send_header("Cache-Control", cache_control)
                 self.end_headers()
-                self.wfile.write(body)
-        except urllib.error.HTTPError as err:
-            detail = err.read().decode("utf-8", errors="replace")
-            self._send_json(
-                {
-                    "error": f"Upstream HiPS request failed with HTTP {err.code}",
-                    "url": target_url,
-                    "detail": detail[:500],
-                },
-                err.code,
-            )
-        except Exception as err:
-            self._send_json(
-                {
-                    "error": f"Upstream HiPS request failed: {err}",
-                    "url": target_url,
-                },
-                502,
-            )
+                self.wfile.write(data)
+        except urllib.error.HTTPError as e:
+            self.send_error(e.code, str(e.reason))
+        except Exception as e:
+            self.send_error(502, f"Proxy error: {e}")
 
     def log_message(self, format, *args):
         # Quieter logging

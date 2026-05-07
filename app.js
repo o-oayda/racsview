@@ -13,7 +13,7 @@ const SURVEY_CONFIG = {
   low3: {
     label: "RACS-low3 (943.5 MHz)",
     source: "static",
-    url: "/api/hips/racs-low3/",
+    url: "/proxy/hips/RACSlow3_I1/",
     title: "RACS-low3",
     frame: "equatorial",
     initialRa: 279.5,
@@ -24,6 +24,16 @@ const SURVEY_CONFIG = {
     label: "RACS-mid (1367.5 MHz)",
     source: "registry",
     id: "CSIRO/P/RACS/mid/I",
+  },
+  high: {
+    label: "RACS-high (1655.5 MHz)",
+    source: "static",
+    url: "/proxy/hips/RACShigh1_I1/",
+    title: "RACS-high",
+    frame: "equatorial",
+    initialRa: 180,
+    initialDec: -30,
+    initialFov: 6,
   },
 };
 
