@@ -3,10 +3,28 @@
 // CDS MocServer query endpoint (HiPS registry/aggregator)
 const MOCSERVER = "https://alasky.cds.unistra.fr/MocServer/query";
 
-// HiPS survey IDs available on CDS/CASDA
-const IDS = {
-  low: "CSIRO/P/RACS/low/I",
-  mid: "CSIRO/P/RACS/mid/I",
+// HiPS surveys available either via CDS MocServer or direct HiPS base URLs.
+const SURVEY_CONFIG = {
+  low: {
+    label: "RACS-low (887.5 MHz)",
+    source: "registry",
+    id: "CSIRO/P/RACS/low/I",
+  },
+  low3: {
+    label: "RACS-low3 (943.5 MHz)",
+    source: "static",
+    url: "/api/hips/racs-low3/",
+    title: "RACS-low3",
+    frame: "equatorial",
+    initialRa: 279.5,
+    initialDec: -31.7,
+    initialFov: 6,
+  },
+  mid: {
+    label: "RACS-mid (1367.5 MHz)",
+    source: "registry",
+    id: "CSIRO/P/RACS/mid/I",
+  },
 };
 
 const CATALOG_MIN_RADIUS_DEG = 0.2;
@@ -210,6 +228,42 @@ function makeSurveyFromRecord(rec) {
   });
 }
 
+function makeSurveyFromStaticConfig(cfg) {
+  return A.HiPS(cfg.url, {
+    name: cfg.title || cfg.label || "HiPS",
+    cooFrame: cfg.frame || "equatorial",
+  });
+}
+
+async function loadSurveyDefinition(which) {
+  const cfg = SURVEY_CONFIG[which];
+  if (!cfg) throw new Error(`Unknown survey: ${which}`);
+
+  if (cfg.source === "registry") {
+    const rec = await fetchHipsRecordById(cfg.id);
+    return {
+      record: rec,
+      survey: makeSurveyFromRecord(rec),
+    };
+  }
+
+  if (cfg.source === "static") {
+    const record = {
+      ID: cfg.title || which,
+      obs_title: cfg.title || cfg.label || which,
+      hips_initial_ra: cfg.initialRa,
+      hips_initial_dec: cfg.initialDec,
+      hips_initial_fov: cfg.initialFov,
+    };
+    return {
+      record,
+      survey: makeSurveyFromStaticConfig(cfg),
+    };
+  }
+
+  throw new Error(`Unsupported survey source: ${cfg.source}`);
+}
+
 // ===========================================================================
 // State
 // ===========================================================================
@@ -223,6 +277,17 @@ const state = {
 function setSourceControlsEnabled(enabled) {
   btnLoadSrcEl.disabled = !enabled;
   selCatalogueEl.disabled = !enabled;
+}
+
+function populateImageDropdown() {
+  selImageEl.innerHTML = "";
+
+  for (const [key, cfg] of Object.entries(SURVEY_CONFIG)) {
+    const opt = document.createElement("option");
+    opt.value = key;
+    opt.textContent = cfg.label || key;
+    selImageEl.appendChild(opt);
+  }
 }
 
 async function pickDatastoreDirectory() {
@@ -558,16 +623,19 @@ async function init() {
 
   initOverlayCanvas();
 
-  setStatus("Querying CDS HiPS registry…");
+  setStatus("Loading HiPS surveys…");
+  populateImageDropdown();
 
-  const [recLow, recMid] = await Promise.all([
-    fetchHipsRecordById(IDS.low),
-    fetchHipsRecordById(IDS.mid),
-  ]);
-  state.records.low = recLow;
-  state.records.mid = recMid;
-  state.surveys.low = makeSurveyFromRecord(recLow);
-  state.surveys.mid = makeSurveyFromRecord(recMid);
+  const surveyEntries = await Promise.all(
+    Object.keys(SURVEY_CONFIG).map(async (which) => {
+      const loaded = await loadSurveyDefinition(which);
+      return [which, loaded];
+    })
+  );
+  for (const [which, loaded] of surveyEntries) {
+    state.records[which] = loaded.record;
+    state.surveys[which] = loaded.survey;
+  }
 
   populateCatalogueDropdown();
 

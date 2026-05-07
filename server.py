@@ -7,7 +7,11 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
+import urllib.request
+
+RACS_LOW3_HIPS_BASE_URL = "https://www.atnf.csiro.au/research/RACS/RACSlow3_I1/"
 
 SUPPORTED_CATALOGUE_EXTENSIONS = (".fits", ".csv", ".dat")
 
@@ -386,6 +390,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._handle_sources(parsed.query)
         elif parsed.path == "/api/healpix/grid":
             self._handle_healpix_grid(parsed.query)
+        elif parsed.path.startswith("/api/hips/racs-low3/"):
+            self._handle_racslow3_hips_proxy(parsed)
         else:
             super().do_GET()
 
@@ -612,6 +618,56 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             })
 
         self._send_json(result)
+
+    def _handle_racslow3_hips_proxy(self, parsed):
+        prefix = "/api/hips/racs-low3/"
+        rel_path = parsed.path[len(prefix):]
+        rel_path = rel_path.lstrip("/")
+        target_url = urllib.parse.urljoin(RACS_LOW3_HIPS_BASE_URL, rel_path)
+        if parsed.query:
+            target_url = f"{target_url}?{parsed.query}"
+
+        request = urllib.request.Request(
+            target_url,
+            headers={
+                "User-Agent": "racsview/1.0",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request) as response:
+                body = response.read()
+                content_type = response.headers.get_content_type()
+                content_length = response.headers.get("Content-Length")
+                cache_control = response.headers.get("Cache-Control")
+
+                self.send_response(response.status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                if content_length:
+                    self.send_header("Content-Length", content_length)
+                if cache_control:
+                    self.send_header("Cache-Control", cache_control)
+                self.end_headers()
+                self.wfile.write(body)
+        except urllib.error.HTTPError as err:
+            detail = err.read().decode("utf-8", errors="replace")
+            self._send_json(
+                {
+                    "error": f"Upstream HiPS request failed with HTTP {err.code}",
+                    "url": target_url,
+                    "detail": detail[:500],
+                },
+                err.code,
+            )
+        except Exception as err:
+            self._send_json(
+                {
+                    "error": f"Upstream HiPS request failed: {err}",
+                    "url": target_url,
+                },
+                502,
+            )
 
     def log_message(self, format, *args):
         # Quieter logging
