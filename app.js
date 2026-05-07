@@ -3,21 +3,37 @@
 // CDS MocServer query endpoint (HiPS registry/aggregator)
 const MOCSERVER = "https://alasky.cds.unistra.fr/MocServer/query";
 
-// HiPS survey IDs available on CDS/CASDA
-const IDS = {
-  low: "CSIRO/P/RACS/low/I",
-  mid: "CSIRO/P/RACS/mid/I",
-  // RACS-high is not in CDS registry; loaded directly from ATNF
-};
-
-// Direct HiPS definitions (not in CDS MocServer — proxied through server.py)
-const DIRECT_HIPS = {
+// HiPS surveys available either via CDS MocServer or direct HiPS base URLs.
+const SURVEY_CONFIG = {
+  low: {
+    label: "RACS-low (887.5 MHz)",
+    source: "registry",
+    id: "CSIRO/P/RACS/low/I",
+  },
+  low3: {
+    label: "RACS-low3 (943.5 MHz)",
+    source: "static",
+    url: "/proxy/hips/RACSlow3_I1/",
+    title: "RACS-low3",
+    frame: "equatorial",
+    initialRa: 279.5,
+    initialDec: -31.7,
+    initialFov: 6,
+  },
+  mid: {
+    label: "RACS-mid (1367.5 MHz)",
+    source: "registry",
+    id: "CSIRO/P/RACS/mid/I",
+  },
   high: {
-    url: "/proxy/hips/RACShigh1_I1",
-    name: "RACS-high (1655.5 MHz)",
-    cooFrame: "equatorial",
-    maxOrder: 9,
-    imgFormat: "png",
+    label: "RACS-high (1655.5 MHz)",
+    source: "static",
+    url: "/proxy/hips/RACShigh1_I1/",
+    title: "RACS-high",
+    frame: "equatorial",
+    initialRa: 180,
+    initialDec: -30,
+    initialFov: 6,
   },
 };
 
@@ -222,6 +238,42 @@ function makeSurveyFromRecord(rec) {
   });
 }
 
+function makeSurveyFromStaticConfig(cfg) {
+  return A.HiPS(cfg.url, {
+    name: cfg.title || cfg.label || "HiPS",
+    cooFrame: cfg.frame || "equatorial",
+  });
+}
+
+async function loadSurveyDefinition(which) {
+  const cfg = SURVEY_CONFIG[which];
+  if (!cfg) throw new Error(`Unknown survey: ${which}`);
+
+  if (cfg.source === "registry") {
+    const rec = await fetchHipsRecordById(cfg.id);
+    return {
+      record: rec,
+      survey: makeSurveyFromRecord(rec),
+    };
+  }
+
+  if (cfg.source === "static") {
+    const record = {
+      ID: cfg.title || which,
+      obs_title: cfg.title || cfg.label || which,
+      hips_initial_ra: cfg.initialRa,
+      hips_initial_dec: cfg.initialDec,
+      hips_initial_fov: cfg.initialFov,
+    };
+    return {
+      record,
+      survey: makeSurveyFromStaticConfig(cfg),
+    };
+  }
+
+  throw new Error(`Unsupported survey source: ${cfg.source}`);
+}
+
 // ===========================================================================
 // State
 // ===========================================================================
@@ -235,6 +287,17 @@ const state = {
 function setSourceControlsEnabled(enabled) {
   btnLoadSrcEl.disabled = !enabled;
   selCatalogueEl.disabled = !enabled;
+}
+
+function populateImageDropdown() {
+  selImageEl.innerHTML = "";
+
+  for (const [key, cfg] of Object.entries(SURVEY_CONFIG)) {
+    const opt = document.createElement("option");
+    opt.value = key;
+    opt.textContent = cfg.label || key;
+    selImageEl.appendChild(opt);
+  }
 }
 
 async function pickDatastoreDirectory() {
@@ -570,31 +633,19 @@ async function init() {
 
   initOverlayCanvas();
 
-  setStatus("Querying CDS HiPS registry…");
+  setStatus("Loading HiPS surveys…");
+  populateImageDropdown();
 
-  const [recLow, recMid] = await Promise.all([
-    fetchHipsRecordById(IDS.low),
-    fetchHipsRecordById(IDS.mid),
-  ]);
-  state.records.low = recLow;
-  state.records.mid = recMid;
-  state.surveys.low = makeSurveyFromRecord(recLow);
-  state.surveys.mid = makeSurveyFromRecord(recMid);
-
-  // RACS-high: loaded directly from ATNF (not in CDS MocServer)
-  state.records.high = {
-    obs_title: "RACS-high (1655.5 MHz)",
-    ID: "RACS-high",
-    dataproduct_type: "image",
-    hips_service_url: DIRECT_HIPS.high.url,
-    hips_frame: "equatorial",
-    hips_order: DIRECT_HIPS.high.maxOrder,
-    hips_tile_format: "png",
-    hips_initial_ra: 180,
-    hips_initial_dec: -30,
-    hips_initial_fov: 6,
-  };
-  state.surveys.high = makeSurveyFromRecord(state.records.high);
+  const surveyEntries = await Promise.all(
+    Object.keys(SURVEY_CONFIG).map(async (which) => {
+      const loaded = await loadSurveyDefinition(which);
+      return [which, loaded];
+    })
+  );
+  for (const [which, loaded] of surveyEntries) {
+    state.records[which] = loaded.record;
+    state.surveys[which] = loaded.survey;
+  }
 
   populateCatalogueDropdown();
 

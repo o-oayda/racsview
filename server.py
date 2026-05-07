@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -396,6 +397,12 @@ def _cone_search(rows, ra_center, dec_center, radius_deg, min_flux=None):
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    # Allowed remote HiPS base URLs for proxying.
+    PROXY_ALLOWED = {
+        "RACShigh1_I1": "https://www.atnf.csiro.au/research/RACS/RACShigh1_I1",
+        "RACSlow3_I1": "https://www.atnf.csiro.au/research/RACS/RACSlow3_I1",
+    }
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
 
@@ -406,7 +413,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         elif parsed.path == "/api/healpix/grid":
             self._handle_healpix_grid(parsed.query)
         elif parsed.path.startswith("/proxy/hips/"):
-            self._handle_hips_proxy(parsed.path)
+            self._handle_hips_proxy(parsed)
         else:
             super().do_GET()
 
@@ -634,40 +641,43 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         self._send_json(result)
 
-    # Allowed remote HiPS base URLs for proxying
-    PROXY_ALLOWED = {
-        "RACShigh1_I1": "https://www.atnf.csiro.au/research/RACS/RACShigh1_I1",
-    }
-
-    def _handle_hips_proxy(self, path):
+    def _handle_hips_proxy(self, parsed):
         """Reverse-proxy HiPS tile requests to bypass CORS restrictions.
 
         URL pattern: /proxy/hips/<key>/<remainder>
         e.g. /proxy/hips/RACShigh1_I1/properties
              /proxy/hips/RACShigh1_I1/Norder3/Dir0/Npix300.png
         """
-        parts = path.split("/", 4)  # ['', 'proxy', 'hips', key, remainder]
+        parts = parsed.path.split("/", 4)  # ['', 'proxy', 'hips', key, remainder]
         if len(parts) < 5:
             self.send_error(400, "Bad proxy path")
             return
         key = parts[3]
-        remainder = parts[4]
+        remainder = parts[4].lstrip("/")
 
         base_url = self.PROXY_ALLOWED.get(key)
         if not base_url:
             self.send_error(403, f"Unknown HiPS key: {key}")
             return
 
-        remote_url = f"{base_url}/{remainder}"
+        remote_url = f"{base_url}/{remainder}" if remainder else base_url
+        if parsed.query:
+            remote_url = f"{remote_url}?{parsed.query}"
         try:
-            req = urllib.request.Request(remote_url)
+            req = urllib.request.Request(
+                remote_url,
+                headers={"User-Agent": "racsview/1.0"},
+            )
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = resp.read()
                 content_type = resp.headers.get("Content-Type", "application/octet-stream")
-                self.send_response(200)
+                self.send_response(resp.status)
                 self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(data)))
                 self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(data)))
+                cache_control = resp.headers.get("Cache-Control")
+                if cache_control:
+                    self.send_header("Cache-Control", cache_control)
                 self.end_headers()
                 self.wfile.write(data)
         except urllib.error.HTTPError as e:
