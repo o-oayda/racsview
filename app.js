@@ -55,14 +55,35 @@ const selCatalogueEl = document.getElementById("selCatalogue");
 const btnLoadImgEl = document.getElementById("btnLoadImg");
 const btnLoadSrcEl = document.getElementById("btnLoadSrc");
 const btnConfigDataEl = document.getElementById("btnConfigData");
+const btnOverlayEl = document.getElementById("btnOverlay");
+const btnClearOverlayEl = document.getElementById("btnClearOverlay");
+const overlayOpacityEl = document.getElementById("overlayOpacity");
+const overlayOpacityValueEl = document.getElementById("overlayOpacityValue");
+const overlayMetaEl = document.getElementById("overlayMeta");
 const btnCircleEl = document.getElementById("btnCircle");
 const circleRadiusEl = document.getElementById("circleRadius");
 const btnGridEl = document.getElementById("btnGrid");
 const gridNsideEl = document.getElementById("gridNside");
+const overlayDialogEl = document.getElementById("overlayDialog");
+const overlayFormEl = document.getElementById("overlayForm");
+const overlayPathEl = document.getElementById("overlayPath");
+const overlayArrayKeyEl = document.getElementById("overlayArrayKey");
+const overlayTitleEl = document.getElementById("overlayTitle");
+const overlayFrameEl = document.getElementById("overlayFrame");
+const overlayOrderingEl = document.getElementById("overlayOrdering");
+const overlayColormapEl = document.getElementById("overlayColormap");
+const overlayDialogOpacityEl = document.getElementById("overlayDialogOpacity");
+const overlayMinEl = document.getElementById("overlayMin");
+const overlayMaxEl = document.getElementById("overlayMax");
+const overlayInspectSummaryEl = document.getElementById("overlayInspectSummary");
+const btnInspectOverlayEl = document.getElementById("btnInspectOverlay");
+const btnApplyOverlayEl = document.getElementById("btnApplyOverlay");
+const btnCloseOverlayEl = document.getElementById("btnCloseOverlay");
 
 const setStatus = (s) => { statusEl.textContent = s; };
 
 let aladin = null;
+const OVERLAY_LAYER_NAME = "hpmap-overlay";
 
 // Get HEALPix frame from Aladin's current coordinate frame.
 // Try aladin.getFrame() first; fall back to reading the cooFrame option.
@@ -282,6 +303,8 @@ const state = {
   records: {},
   surveys: {},
   currentCat: null,
+  overlay: null,
+  overlayInspection: null,
 };
 
 function setSourceControlsEnabled(enabled) {
@@ -315,6 +338,236 @@ async function pickDatastoreDirectory() {
     setStatus(`Datastore configuration failed: ${err.message || err}`);
   } finally {
     btnConfigDataEl.disabled = false;
+  }
+}
+
+function setOverlayControlsEnabled(enabled) {
+  btnClearOverlayEl.disabled = !enabled;
+  overlayOpacityEl.disabled = !enabled;
+}
+
+function updateOverlayMetaLabel() {
+  if (!state.overlay) {
+    overlayMetaEl.textContent = "No overlay";
+    overlayOpacityValueEl.textContent = overlayOpacityEl.value;
+    setOverlayControlsEnabled(false);
+    return;
+  }
+  overlayMetaEl.textContent = `${state.overlay.title} [${state.overlay.frame}, ${state.overlay.colormap}]`;
+  overlayOpacityEl.value = String(state.overlay.opacity);
+  overlayOpacityValueEl.textContent = Number(state.overlay.opacity).toFixed(2);
+  setOverlayControlsEnabled(true);
+}
+
+function resetOverlayArrayKeyOptions(keys = [], selected = "") {
+  overlayArrayKeyEl.innerHTML = "";
+  const autoOpt = document.createElement("option");
+  autoOpt.value = "";
+  autoOpt.textContent = "Auto-detect";
+  overlayArrayKeyEl.appendChild(autoOpt);
+
+  if (selected && !keys.includes(selected)) {
+    const opt = document.createElement("option");
+    opt.value = selected;
+    opt.textContent = selected;
+    overlayArrayKeyEl.appendChild(opt);
+  }
+  for (const key of keys) {
+    const opt = document.createElement("option");
+    opt.value = key;
+    opt.textContent = key;
+    overlayArrayKeyEl.appendChild(opt);
+  }
+  overlayArrayKeyEl.value = selected || "";
+}
+
+function applyOverlayInspection(info) {
+  state.overlayInspection = info;
+  resetOverlayArrayKeyOptions(info.array_keys || [], info.array_key || "");
+  overlayTitleEl.value = info.title || "";
+  overlayFrameEl.value = info.frame || "";
+  overlayOrderingEl.value = info.ordering || "";
+  overlayMinEl.value = Number(info.suggested_min ?? info.data_min ?? 0).toString();
+  overlayMaxEl.value = Number(info.suggested_max ?? info.data_max ?? 1).toString();
+  overlayInspectSummaryEl.textContent =
+    `nside=${info.nside}, npix=${info.npix}, data range ${info.data_min} to ${info.data_max}`;
+}
+
+function fillOverlayFormFromState() {
+  const current = state.overlay;
+  state.overlayInspection = null;
+  overlayPathEl.value = current ? current.path || "" : "";
+  overlayTitleEl.value = current ? current.title || "" : "";
+  overlayFrameEl.value = current ? current.frame || "" : "";
+  overlayOrderingEl.value = current ? current.ordering || "" : "";
+  overlayColormapEl.value = current ? current.colormap || "viridis" : "viridis";
+  overlayDialogOpacityEl.value = current ? String(current.opacity ?? 0.65) : "0.65";
+  overlayMinEl.value = current ? String(current.vmin ?? "") : "";
+  overlayMaxEl.value = current ? String(current.vmax ?? "") : "";
+  resetOverlayArrayKeyOptions([], current ? current.array_key || "" : "");
+  overlayInspectSummaryEl.textContent = current
+    ? "Edit settings and inspect again if the file path changes."
+    : "Inspect a .npy or .npz HEALPix map to infer defaults.";
+}
+
+function openOverlayDialog() {
+  fillOverlayFormFromState();
+  overlayDialogEl.showModal();
+}
+
+async function inspectOverlayPath() {
+  const path = overlayPathEl.value.trim();
+  if (!path) {
+    setStatus("Enter a local .npy or .npz path first.");
+    return;
+  }
+
+  btnInspectOverlayEl.disabled = true;
+  overlayInspectSummaryEl.textContent = "Inspecting overlay map…";
+  try {
+    const resp = await fetch("/api/overlay/inspect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path,
+        array_key: overlayArrayKeyEl.value || null,
+      }),
+    });
+    const payload = await resp.json().catch(() => ({}));
+    if (!resp.ok || !payload.ok) {
+      throw new Error(payload.error || `HTTP ${resp.status}`);
+    }
+    applyOverlayInspection(payload.overlay);
+    setStatus(`Inspected overlay map: ${payload.overlay.path}`);
+  } catch (err) {
+    overlayInspectSummaryEl.textContent = `Inspect failed: ${err.message || err}`;
+    setStatus(`Overlay inspect failed: ${err.message || err}`);
+  } finally {
+    btnInspectOverlayEl.disabled = false;
+  }
+}
+
+async function applyOverlayFromForm() {
+  const path = overlayPathEl.value.trim();
+  if (!path) {
+    setStatus("Overlay path is required.");
+    return;
+  }
+
+  const body = {
+    path,
+    array_key: overlayArrayKeyEl.value || null,
+    title: overlayTitleEl.value.trim() || null,
+    frame: overlayFrameEl.value || null,
+    ordering: overlayOrderingEl.value || null,
+    colormap: overlayColormapEl.value,
+    vmin: overlayMinEl.value === "" ? null : Number(overlayMinEl.value),
+    vmax: overlayMaxEl.value === "" ? null : Number(overlayMaxEl.value),
+    opacity: Number(overlayDialogOpacityEl.value),
+  };
+
+  btnApplyOverlayEl.disabled = true;
+  setStatus("Generating overlay HiPS layer…");
+  try {
+    const resp = await fetch("/api/overlay/load", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const payload = await resp.json().catch(() => ({}));
+    if (!resp.ok || !payload.ok) {
+      throw new Error(payload.error || `HTTP ${resp.status}`);
+    }
+    await installOverlayLayer(payload.overlay);
+    overlayDialogEl.close();
+    setStatus(`Overlay loaded: ${payload.overlay.title}`);
+  } catch (err) {
+    setStatus(`Overlay load failed: ${err.message || err}`);
+  } finally {
+    btnApplyOverlayEl.disabled = false;
+  }
+}
+
+async function installOverlayLayer(overlay) {
+  const survey = A.HiPS(overlay.hips_url, {
+    name: overlay.title,
+    cooFrame: overlay.frame,
+    maxOrder: overlay.max_order,
+    imgFormat: "png",
+  });
+  aladin.setOverlayImageLayer(survey, OVERLAY_LAYER_NAME);
+  state.overlay = overlay;
+  updateOverlayMetaLabel();
+
+  try {
+    const layer = aladin.getOverlayImageLayer(OVERLAY_LAYER_NAME);
+    if (layer && typeof layer.setOpacity === "function") {
+      layer.setOpacity(overlay.opacity);
+    } else if (layer && typeof layer.setAlpha === "function") {
+      layer.setAlpha(overlay.opacity);
+    }
+  } catch (_) {}
+}
+
+async function syncOverlayStatus() {
+  try {
+    const resp = await fetch("/api/overlay/status");
+    if (!resp.ok) return;
+    const payload = await resp.json();
+    if (payload.overlay) {
+      await installOverlayLayer(payload.overlay);
+    } else {
+      state.overlay = null;
+      updateOverlayMetaLabel();
+    }
+  } catch (err) {
+    console.error("Failed to sync overlay status:", err);
+  }
+}
+
+async function clearOverlay() {
+  btnClearOverlayEl.disabled = true;
+  setStatus("Clearing overlay…");
+  try {
+    const resp = await fetch("/api/overlay/clear", { method: "POST" });
+    const payload = await resp.json().catch(() => ({}));
+    if (!resp.ok || !payload.ok) {
+      throw new Error(payload.error || `HTTP ${resp.status}`);
+    }
+    try {
+      const layer = aladin.getOverlayImageLayer(OVERLAY_LAYER_NAME);
+      if (layer && typeof layer.setOpacity === "function") {
+        layer.setOpacity(0);
+      } else if (layer && typeof layer.setAlpha === "function") {
+        layer.setAlpha(0);
+      }
+    } catch (_) {}
+    state.overlay = null;
+    updateOverlayMetaLabel();
+    setStatus("Overlay cleared.");
+  } catch (err) {
+    setStatus(`Overlay clear failed: ${err.message || err}`);
+    updateOverlayMetaLabel();
+  }
+}
+
+function updateOverlayOpacityLabel() {
+  overlayOpacityValueEl.textContent = Number(overlayOpacityEl.value).toFixed(2);
+}
+
+function applyOverlayOpacity() {
+  updateOverlayOpacityLabel();
+  if (!state.overlay) return;
+  state.overlay.opacity = Number(overlayOpacityEl.value);
+  try {
+    const layer = aladin.getOverlayImageLayer(OVERLAY_LAYER_NAME);
+    if (layer && typeof layer.setOpacity === "function") {
+      layer.setOpacity(state.overlay.opacity);
+    } else if (layer && typeof layer.setAlpha === "function") {
+      layer.setAlpha(state.overlay.opacity);
+    }
+  } catch (err) {
+    console.error("Failed to update overlay opacity:", err);
   }
 }
 
@@ -648,6 +901,7 @@ async function init() {
   }
 
   populateCatalogueDropdown();
+  updateOverlayMetaLabel();
 
   // Enable UI
   btnLoadImgEl.disabled = false;
@@ -670,6 +924,24 @@ async function init() {
       setStatus(`Datastore configuration failed: ${e.message || e}`);
     });
   };
+  btnOverlayEl.onclick = () => {
+    openOverlayDialog();
+  };
+  btnClearOverlayEl.onclick = () => {
+    clearOverlay().catch((e) => setStatus(`Overlay clear failed: ${e.message || e}`));
+  };
+  btnInspectOverlayEl.onclick = () => {
+    inspectOverlayPath().catch((e) => setStatus(`Overlay inspect failed: ${e.message || e}`));
+  };
+  btnCloseOverlayEl.onclick = () => {
+    overlayDialogEl.close();
+  };
+  overlayFormEl.addEventListener("submit", (event) => {
+    event.preventDefault();
+    applyOverlayFromForm().catch((e) => setStatus(`Overlay load failed: ${e.message || e}`));
+  });
+  overlayOpacityEl.addEventListener("input", updateOverlayOpacityLabel);
+  overlayOpacityEl.addEventListener("change", applyOverlayOpacity);
 
   // --- Circle toggle ---
   btnCircleEl.onclick = () => {
@@ -709,6 +981,7 @@ async function init() {
   await loadImage("low", { recenter: true });
   aladin.setFrame("GAL");
   aladin.gotoPosition(279.5, -31.7);
+  await syncOverlayStatus();
 }
 
 init().catch((e) => {

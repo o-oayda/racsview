@@ -2,7 +2,15 @@
 
 set -euo pipefail
 
-python3 server.py 8000 &
+if [ -x ".venv/bin/python" ]; then
+  PYTHON_BIN=".venv/bin/python"
+elif command -v uv >/dev/null 2>&1; then
+  PYTHON_BIN="uv run python"
+else
+  PYTHON_BIN="python3"
+fi
+
+$PYTHON_BIN server.py 8000 &
 SERVER_PID=$!
 
 cleanup() {

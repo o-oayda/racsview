@@ -13,6 +13,18 @@
     #status { margin-left:auto; opacity:0.8; }
     .sep { width:1px; height:24px; background:#ccc; }
     #aladin { width: 100vw; height: calc(100vh - 42px); position: relative; }
+    dialog { border: 1px solid #bbb; border-radius: 8px; padding: 0; width: min(560px, calc(100vw - 32px)); }
+    dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
+    .modal { padding: 16px; display: grid; gap: 12px; }
+    .modal h2 { margin: 0; font-size: 18px; }
+    .modal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; }
+    .modal-grid label { display: grid; gap: 4px; font-size: 12px; }
+    .modal-grid label.full { grid-column: 1 / -1; }
+    .modal-grid input, .modal-grid select { width: 100%; box-sizing: border-box; padding: 6px 8px; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    .muted { opacity: 0.75; font-size: 12px; }
+    #overlayMeta { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #overlayOpacity { width: 92px; }
   </style>
 </head>
 <body>
@@ -28,6 +40,13 @@
       <option value="">Select catalogue…</option>
     </select>
     <button id="btnConfigData">Set datastore</button>
+    <div class="sep"></div>
+    <button id="btnOverlay">Load overlay</button>
+    <button id="btnClearOverlay" disabled>Clear overlay</button>
+    <label>Overlay α</label>
+    <input id="overlayOpacity" type="range" min="0" max="1" step="0.05" value="0.65" disabled />
+    <span id="overlayOpacityValue">0.65</span>
+    <span id="overlayMeta" class="muted">No overlay</span>
     <label>Min flux (mJy)</label>
     <input id="minFlux" type="number" min="0" step="0.1" value="0" style="width: 72px;" />
     <label>Src size</label>
@@ -44,6 +63,63 @@
   </div>
   <div id="aladin">
   </div>
+
+  <dialog id="overlayDialog">
+    <form method="dialog" class="modal" id="overlayForm">
+      <h2>HEALPix Overlay</h2>
+      <div class="modal-grid">
+        <label class="full">File path
+          <input id="overlayPath" type="text" placeholder="/path/to/map.npz" />
+        </label>
+        <label>Array key
+          <select id="overlayArrayKey">
+            <option value="">Auto-detect</option>
+          </select>
+        </label>
+        <label>Title
+          <input id="overlayTitle" type="text" placeholder="Overlay title" />
+        </label>
+        <label>Frame
+          <select id="overlayFrame">
+            <option value="">Select frame…</option>
+            <option value="equatorial">equatorial</option>
+            <option value="galactic">galactic</option>
+          </select>
+        </label>
+        <label>Ordering
+          <select id="overlayOrdering">
+            <option value="">Select ordering…</option>
+            <option value="nested">NESTED</option>
+            <option value="ring">RING</option>
+          </select>
+        </label>
+        <label>Colormap
+          <select id="overlayColormap">
+            <option value="viridis">viridis</option>
+            <option value="plasma">plasma</option>
+            <option value="magma">magma</option>
+            <option value="grayscale">grayscale</option>
+            <option value="rainbow">rainbow</option>
+          </select>
+        </label>
+        <label>Opacity
+          <input id="overlayDialogOpacity" type="number" min="0" max="1" step="0.05" value="0.65" />
+        </label>
+        <label>Min stretch
+          <input id="overlayMin" type="number" step="any" />
+        </label>
+        <label>Max stretch
+          <input id="overlayMax" type="number" step="any" />
+        </label>
+      </div>
+      <div id="overlayInspectSummary" class="muted">Inspect a .npy or .npz HEALPix map to infer defaults.</div>
+      <div class="modal-actions">
+        <button type="button" id="btnInspectOverlay">Inspect</button>
+        <button type="submit" id="btnApplyOverlay">Load overlay</button>
+        <button type="button" id="btnCloseOverlay">Close</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js" charset="utf-8"></script>
   <script src="./app.js"></script>

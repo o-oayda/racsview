@@ -4,12 +4,15 @@ import http.server
 import json
 import math
 import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 SUPPORTED_CATALOGUE_EXTENSIONS = (".fits", ".csv", ".dat")
 
@@ -66,6 +69,436 @@ _cache = {}
 _datastore_root = None
 _datastore_error = None
 _catalogue_resolution = {}
+_overlay_state = None
+
+OVERLAY_TILE_WIDTH = 512
+OVERLAY_TILE_FORMAT = "png"
+OVERLAY_LAYER_NAME = "hpmap-overlay"
+OVERLAY_DEFAULT_OPACITY = 0.65
+OVERLAY_DEFAULT_COLORMAP = "viridis"
+OVERLAY_MIN_RENDER_ORDER = int(math.log2(OVERLAY_TILE_WIDTH))
+OVERLAY_COLORMAPS = {
+    "grayscale": [
+        (0.0, (0, 0, 0)),
+        (1.0, (255, 255, 255)),
+    ],
+    "viridis": [
+        (0.0, (68, 1, 84)),
+        (0.25, (59, 82, 139)),
+        (0.5, (33, 145, 140)),
+        (0.75, (94, 201, 98)),
+        (1.0, (253, 231, 37)),
+    ],
+    "plasma": [
+        (0.0, (13, 8, 135)),
+        (0.25, (126, 3, 168)),
+        (0.5, (203, 71, 119)),
+        (0.75, (248, 149, 64)),
+        (1.0, (240, 249, 33)),
+    ],
+    "magma": [
+        (0.0, (0, 0, 4)),
+        (0.25, (80, 18, 123)),
+        (0.5, (182, 55, 121)),
+        (0.75, (251, 140, 60)),
+        (1.0, (252, 253, 191)),
+    ],
+    "rainbow": [
+        (0.0, (150, 0, 90)),
+        (0.2, (0, 0, 200)),
+        (0.4, (0, 150, 255)),
+        (0.6, (0, 200, 0)),
+        (0.8, (255, 220, 0)),
+        (1.0, (220, 50, 32)),
+    ],
+}
+
+
+class OverlayValidationError(Exception):
+    """Raised when an overlay map cannot be loaded or rendered."""
+
+
+def _guess_frame_from_text(text):
+    value = str(text or "").lower()
+    if any(token in value for token in ("galactic", "_gal", "-gal", " gal", "coordsys-g")):
+        return "galactic"
+    if any(token in value for token in ("equatorial", "icrs", "_eq", "-eq", " eq", "fk5")):
+        return "equatorial"
+    return None
+
+
+def _guess_ordering_from_text(text):
+    value = str(text or "").lower()
+    if "nested" in value or "nest" in value:
+        return "nested"
+    if "ring" in value:
+        return "ring"
+    return None
+
+
+def _guess_nside_from_text(text):
+    match = re.search(r"nside[_-]?(\d+)", str(text or "").lower())
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _normalise_frame(value):
+    frame = _guess_frame_from_text(value)
+    if frame:
+        return frame
+    if value in ("C", "c"):
+        return "equatorial"
+    if value in ("G", "g"):
+        return "galactic"
+    return None
+
+
+def _normalise_ordering(value):
+    ordering = _guess_ordering_from_text(value)
+    if ordering:
+        return ordering
+    return None
+
+
+def _extract_scalar(value):
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            if value.shape == ():
+                return value.item()
+            return None
+        if isinstance(value, np.generic):
+            return value.item()
+    except Exception:
+        pass
+    return value
+
+
+def _parse_npz_metadata(npz):
+    meta = {"frame": None, "ordering": None, "nside": None, "title": None}
+    for key in npz.files:
+        scalar = _extract_scalar(npz[key])
+        if scalar is None:
+            continue
+        key_lower = key.lower()
+        if meta["frame"] is None and key_lower in ("frame", "coordsys", "coord_system", "coord", "csys"):
+            meta["frame"] = _normalise_frame(scalar)
+        if meta["ordering"] is None and key_lower in ("ordering", "order", "healpix_ordering", "scheme", "nest"):
+            if key_lower == "nest" and isinstance(scalar, (bool, int)):
+                meta["ordering"] = "nested" if bool(scalar) else "ring"
+            else:
+                meta["ordering"] = _normalise_ordering(scalar)
+        if meta["nside"] is None and key_lower == "nside":
+            try:
+                meta["nside"] = int(scalar)
+            except (TypeError, ValueError):
+                pass
+        if meta["title"] is None and key_lower in ("title", "name", "label"):
+            meta["title"] = str(scalar)
+    return meta
+
+
+def _find_npz_arrays(npz):
+    arrays = []
+    for key in npz.files:
+        value = npz[key]
+        if getattr(value, "ndim", None) == 1 and str(getattr(value, "dtype", "")).startswith(
+            ("float", "int", "uint")
+        ):
+            arrays.append(key)
+    return arrays
+
+
+def _select_default_array_key(keys):
+    if not keys:
+        return None
+    preferred = ("map", "hpmap", "healpix_map", "data", "values")
+    lower_map = {key.lower(): key for key in keys}
+    for name in preferred:
+        if name in lower_map:
+            return lower_map[name]
+    return keys[0]
+
+
+def _guess_overlay_defaults(path, npz_meta):
+    basename = os.path.basename(path)
+    stem = os.path.splitext(basename)[0]
+    return {
+        "frame": npz_meta.get("frame") or _guess_frame_from_text(basename),
+        "ordering": npz_meta.get("ordering") or _guess_ordering_from_text(basename),
+        "nside": npz_meta.get("nside") or _guess_nside_from_text(basename),
+        "title": npz_meta.get("title") or stem,
+    }
+
+
+def _inspect_overlay_map(path, array_key=None):
+    import healpy as hp
+    import numpy as np
+
+    if not path:
+        raise OverlayValidationError("Map path is required")
+
+    resolved = os.path.abspath(os.path.expanduser(path))
+    if not os.path.exists(resolved):
+        raise OverlayValidationError(f"Map file does not exist: {resolved}")
+    if not os.path.isfile(resolved):
+        raise OverlayValidationError(f"Map path is not a file: {resolved}")
+
+    ext = os.path.splitext(resolved)[1].lower()
+    if ext not in (".npy", ".npz"):
+        raise OverlayValidationError("Overlay map must be a .npy or .npz file")
+
+    arrays = []
+    npz_meta = {"frame": None, "ordering": None, "nside": None, "title": None}
+    selected_key = None
+    if ext == ".npy":
+        array = np.load(resolved, allow_pickle=False)
+    else:
+        with np.load(resolved, allow_pickle=False) as npz:
+            arrays = _find_npz_arrays(npz)
+            selected_key = array_key or _select_default_array_key(arrays)
+            if not selected_key:
+                raise OverlayValidationError("No 1D numeric HEALPix array found in NPZ file")
+            if selected_key not in npz.files:
+                raise OverlayValidationError(f"Array key not found in NPZ file: {selected_key}")
+            array = np.array(npz[selected_key], copy=False)
+            npz_meta = _parse_npz_metadata(npz)
+
+    if getattr(array, "ndim", None) != 1:
+        raise OverlayValidationError("Overlay map must be a 1D array")
+    if not str(getattr(array, "dtype", "")).startswith(("float", "int", "uint")):
+        raise OverlayValidationError("Overlay map array must be numeric")
+
+    npix = int(array.shape[0])
+    try:
+        inferred_nside = int(hp.npix2nside(npix))
+    except Exception as exc:
+        raise OverlayValidationError(f"Array length is not a valid HEALPix npix: {npix}") from exc
+
+    defaults = _guess_overlay_defaults(resolved, npz_meta)
+    if defaults["nside"] is not None and int(defaults["nside"]) != inferred_nside:
+        raise OverlayValidationError(
+            f"Inferred nside {defaults['nside']} does not match array length npix={npix}"
+        )
+
+    valid_mask = np.isfinite(array) & (array != hp.UNSEEN)
+    if np.any(valid_mask):
+        valid_values = np.asarray(array[valid_mask], dtype=np.float32)
+        data_min = float(np.min(valid_values))
+        data_max = float(np.max(valid_values))
+        suggested_min = float(np.percentile(valid_values, 1))
+        suggested_max = float(np.percentile(valid_values, 99))
+    else:
+        data_min = 0.0
+        data_max = 0.0
+        suggested_min = 0.0
+        suggested_max = 1.0
+
+    return {
+        "path": resolved,
+        "format": ext[1:],
+        "array_key": selected_key,
+        "array_keys": arrays,
+        "npix": npix,
+        "nside": inferred_nside,
+        "frame": defaults["frame"],
+        "ordering": defaults["ordering"],
+        "title": defaults["title"],
+        "data_min": data_min,
+        "data_max": data_max,
+        "suggested_min": suggested_min,
+        "suggested_max": suggested_max,
+    }
+
+
+def _load_overlay_map(path, array_key, frame, ordering, title, colormap, vmin, vmax, opacity):
+    import healpy as hp
+    import numpy as np
+
+    inspect = _inspect_overlay_map(path, array_key)
+    frame = _normalise_frame(frame) or inspect["frame"]
+    ordering = _normalise_ordering(ordering) or inspect["ordering"]
+    title = str(title or inspect["title"] or "HEALPix overlay").strip()
+    if not frame:
+        raise OverlayValidationError("Coordinate frame is required (equatorial or galactic)")
+    if not ordering:
+        raise OverlayValidationError("HEALPix ordering is required (RING or NESTED)")
+    if colormap not in OVERLAY_COLORMAPS:
+        raise OverlayValidationError(f"Unknown colormap: {colormap}")
+
+    ext = os.path.splitext(inspect["path"])[1].lower()
+    if ext == ".npy":
+        raw = np.load(inspect["path"], allow_pickle=False)
+    else:
+        with np.load(inspect["path"], allow_pickle=False) as npz:
+            raw = np.array(npz[inspect["array_key"]], copy=False)
+    values = np.asarray(raw, dtype=np.float32)
+    if ordering == "ring":
+        values = hp.reorder(values, r2n=True)
+
+    valid_mask = np.isfinite(values) & (values != hp.UNSEEN)
+    if not np.any(valid_mask):
+        raise OverlayValidationError("Overlay map contains no finite HEALPix values")
+
+    if vmin is None:
+        vmin = inspect["suggested_min"]
+    if vmax is None:
+        vmax = inspect["suggested_max"]
+    try:
+        vmin = float(vmin)
+        vmax = float(vmax)
+        opacity = float(opacity)
+    except (TypeError, ValueError) as exc:
+        raise OverlayValidationError("Stretch and opacity values must be numeric") from exc
+    if not math.isfinite(vmin) or not math.isfinite(vmax):
+        raise OverlayValidationError("Stretch values must be finite numbers")
+    if vmax <= vmin:
+        raise OverlayValidationError("Max stretch must be greater than min stretch")
+    if opacity < 0 or opacity > 1:
+        raise OverlayValidationError("Opacity must be between 0 and 1")
+
+    map_order = int(round(math.log2(inspect["nside"])))
+    max_tile_order = max(0, map_order - OVERLAY_MIN_RENDER_ORDER)
+    return {
+        "path": inspect["path"],
+        "format": inspect["format"],
+        "array_key": inspect["array_key"],
+        "array_keys": inspect["array_keys"],
+        "map_nested": values,
+        "frame": frame,
+        "ordering": ordering,
+        "title": title,
+        "npix": inspect["npix"],
+        "nside": inspect["nside"],
+        "map_order": map_order,
+        "max_tile_order": max_tile_order,
+        "colormap": colormap,
+        "vmin": vmin,
+        "vmax": vmax,
+        "opacity": opacity,
+        "render_cache": {},
+        "data_min": inspect["data_min"],
+        "data_max": inspect["data_max"],
+        "suggested_min": inspect["suggested_min"],
+        "suggested_max": inspect["suggested_max"],
+    }
+
+
+def _overlay_response_payload():
+    if _overlay_state is None:
+        return None
+    return {
+        "layer_name": OVERLAY_LAYER_NAME,
+        "title": _overlay_state["title"],
+        "frame": _overlay_state["frame"],
+        "ordering": _overlay_state["ordering"],
+        "map_order": _overlay_state["map_order"],
+        "max_order": _overlay_state["max_tile_order"],
+        "colormap": _overlay_state["colormap"],
+        "vmin": _overlay_state["vmin"],
+        "vmax": _overlay_state["vmax"],
+        "opacity": _overlay_state["opacity"],
+        "path": _overlay_state["path"],
+        "array_key": _overlay_state["array_key"],
+        "hips_url": "/api/overlay/hips/current",
+    }
+
+
+def _get_overlay_values_for_order(order):
+    import healpy as hp
+    import numpy as np
+
+    if _overlay_state is None:
+        raise OverlayValidationError("No overlay is loaded")
+    cache = _overlay_state["render_cache"]
+    if order in cache:
+        return cache[order]
+    nside_out = 1 << order
+    cache[order] = hp.ud_grade(
+        _overlay_state["map_nested"],
+        nside_out=nside_out,
+        order_in="NESTED",
+        order_out="NESTED",
+        dtype=np.float32,
+    )
+    return cache[order]
+
+
+def _interpolate_colormap(colormap_name, values):
+    import numpy as np
+
+    stops = OVERLAY_COLORMAPS[colormap_name]
+    positions = np.array([stop[0] for stop in stops], dtype=np.float32)
+    colors = np.array([stop[1] for stop in stops], dtype=np.float32)
+    flat = values.reshape(-1)
+    rgb = np.empty((flat.size, 3), dtype=np.uint8)
+    for channel in range(3):
+        rgb[:, channel] = np.interp(flat, positions, colors[:, channel]).astype(np.uint8)
+    return rgb.reshape(values.shape + (3,))
+
+
+def _render_overlay_tile(tile_order, tile_pix):
+    import healpy as hp
+    import numpy as np
+
+    if _overlay_state is None:
+        raise OverlayValidationError("No overlay is loaded")
+    if tile_order < 0 or tile_order > _overlay_state["max_tile_order"]:
+        raise OverlayValidationError(f"Tile order out of range: {tile_order}")
+
+    render_order = tile_order + OVERLAY_MIN_RENDER_ORDER
+    render_values = _get_overlay_values_for_order(render_order)
+    nside_tile = 1 << tile_order
+    nside_render = 1 << render_order
+
+    parent_x, parent_y, face = hp.pix2xyf(nside_tile, tile_pix, nest=True)
+    x_local = np.arange(OVERLAY_TILE_WIDTH, dtype=np.int64)
+    y_local = np.arange(OVERLAY_TILE_WIDTH - 1, -1, -1, dtype=np.int64)
+    x_grid, y_grid = np.meshgrid(
+        (parent_x << OVERLAY_MIN_RENDER_ORDER) + x_local,
+        (parent_y << OVERLAY_MIN_RENDER_ORDER) + y_local,
+        indexing="xy",
+    )
+    render_pix = hp.xyf2pix(nside_render, x_grid, y_grid, face, nest=True)
+    values = render_values[render_pix]
+
+    mask = np.isfinite(values) & (values != hp.UNSEEN)
+    if not np.any(mask):
+        rgba = np.zeros((OVERLAY_TILE_WIDTH, OVERLAY_TILE_WIDTH, 4), dtype=np.uint8)
+        return _encode_png_rgba(rgba)
+
+    span = _overlay_state["vmax"] - _overlay_state["vmin"]
+    scaled = np.clip((values - _overlay_state["vmin"]) / span, 0.0, 1.0)
+    rgb = _interpolate_colormap(_overlay_state["colormap"], scaled)
+    alpha = np.where(mask, 255, 0).astype(np.uint8)
+    rgba = np.dstack((rgb, alpha))
+    return _encode_png_rgba(rgba)
+
+
+def _encode_png_chunk(tag, payload):
+    return (
+        struct.pack("!I", len(payload))
+        + tag
+        + payload
+        + struct.pack("!I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+    )
+
+
+def _encode_png_rgba(rgba):
+    height, width, depth = rgba.shape
+    if depth != 4:
+        raise ValueError("Expected RGBA image data")
+    signature = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack("!IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    rows = []
+    for row in rgba:
+        rows.append(b"\x00" + row.tobytes())
+    compressed = zlib.compress(b"".join(rows), level=6)
+    return signature + _encode_png_chunk(b"IHDR", ihdr) + _encode_png_chunk(
+        b"IDAT", compressed
+    ) + _encode_png_chunk(b"IEND", b"")
 
 
 class CatalogueResolutionError(Exception):
@@ -408,10 +841,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         if parsed.path == "/api/catalogues":
             self._handle_list_catalogues()
+        elif parsed.path == "/api/overlay/status":
+            self._handle_overlay_status()
         elif parsed.path == "/api/sources":
             self._handle_sources(parsed.query)
         elif parsed.path == "/api/healpix/grid":
             self._handle_healpix_grid(parsed.query)
+        elif parsed.path == "/api/overlay/hips/current/properties":
+            self._handle_overlay_properties()
+        elif parsed.path.startswith("/api/overlay/hips/current/"):
+            self._handle_overlay_tile(parsed.path)
         elif parsed.path.startswith("/proxy/hips/"):
             self._handle_hips_proxy(parsed)
         else:
@@ -424,6 +863,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/config/datastore/pick":
             self._handle_pick_datastore()
+            return
+        if parsed.path == "/api/overlay/inspect":
+            self._handle_overlay_inspect()
+            return
+        if parsed.path == "/api/overlay/load":
+            self._handle_overlay_load()
+            return
+        if parsed.path == "/api/overlay/clear":
+            self._handle_overlay_clear()
             return
         self.send_error(404)
 
@@ -455,6 +903,56 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "message": resolution["message"],
             })
         self._send_json(cats)
+
+    def _handle_overlay_status(self):
+        self._send_json({"overlay": _overlay_response_payload()})
+
+    def _handle_overlay_inspect(self):
+        try:
+            body = self._read_json_body()
+        except json.JSONDecodeError:
+            self._send_json({"error": "Request body must be valid JSON"}, 400)
+            return
+
+        try:
+            info = _inspect_overlay_map(body.get("path"), body.get("array_key"))
+        except OverlayValidationError as exc:
+            self._send_json({"error": str(exc)}, 400)
+            return
+        self._send_json({"ok": True, "overlay": info})
+
+    def _handle_overlay_load(self):
+        global _overlay_state
+
+        try:
+            body = self._read_json_body()
+        except json.JSONDecodeError:
+            self._send_json({"error": "Request body must be valid JSON"}, 400)
+            return
+
+        try:
+            _overlay_state = _load_overlay_map(
+                body.get("path"),
+                body.get("array_key"),
+                body.get("frame"),
+                body.get("ordering"),
+                body.get("title"),
+                body.get("colormap") or OVERLAY_DEFAULT_COLORMAP,
+                body.get("vmin"),
+                body.get("vmax"),
+                body.get("opacity", OVERLAY_DEFAULT_OPACITY),
+            )
+        except OverlayValidationError as exc:
+            self._send_json({"error": str(exc)}, 400)
+            return
+
+        self._send_json({"ok": True, "overlay": _overlay_response_payload()})
+
+    def _handle_overlay_clear(self):
+        global _overlay_state
+
+        _overlay_state = None
+        self._send_json({"ok": True})
 
     def _handle_sources(self, query_string):
         params = urllib.parse.parse_qs(query_string)
@@ -640,6 +1138,74 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             })
 
         self._send_json(result)
+
+    def _handle_overlay_properties(self):
+        if _overlay_state is None:
+            self.send_error(404, "No overlay is loaded")
+            return
+
+        initial_ra = 180 if _overlay_state["frame"] == "equatorial" else 0
+        initial_dec = 0
+        frame = _overlay_state["frame"]
+        properties = "\n".join(
+            [
+                f"creator_did = ivo://local/racsview/{OVERLAY_LAYER_NAME}",
+                f"obs_title = {_overlay_state['title']}",
+                "hips_version = 1.4",
+                f"hips_frame = {frame}",
+                f"hips_order = {_overlay_state['max_tile_order']}",
+                "hips_order_min = 0",
+                f"hips_tile_width = {OVERLAY_TILE_WIDTH}",
+                f"hips_tile_format = {OVERLAY_TILE_FORMAT}",
+                "dataproduct_type = image",
+                "hips_status = public master clonableOnce",
+                f"hips_initial_ra = {initial_ra}",
+                f"hips_initial_dec = {initial_dec}",
+                "hips_initial_fov = 90",
+                "",
+            ]
+        ).encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(properties)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(properties)
+
+    def _handle_overlay_tile(self, path):
+        if _overlay_state is None:
+            self.send_error(404, "No overlay is loaded")
+            return
+
+        path = re.sub(r"/+", "/", path)
+
+        match = re.fullmatch(
+            r"/api/overlay/hips/current/Norder(\d+)/Dir\d+/Npix(\d+)\.png",
+            path,
+        )
+        if not match:
+            self.send_error(404, "Unknown overlay tile path")
+            return
+
+        tile_order = int(match.group(1))
+        tile_pix = int(match.group(2))
+        try:
+            body = _render_overlay_tile(tile_order, tile_pix)
+        except OverlayValidationError as exc:
+            self.send_error(400, str(exc))
+            return
+        except Exception as exc:
+            self.send_error(500, f"Overlay tile render failed: {exc}")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_hips_proxy(self, parsed):
         """Reverse-proxy HiPS tile requests to bypass CORS restrictions.
