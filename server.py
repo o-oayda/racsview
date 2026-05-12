@@ -19,6 +19,10 @@ CATALOGUES = {
         "basename": "RACS-low1_sources_25arcsec_allsources.fits",
         "ra": "ra", "dec": "dec", "flux": "total_flux_source", "id": "source_id",
     },
+    "racs-low2": {
+        "basename": "RACS-low2_sources_patched.fits",
+        "ra": "RA", "dec": "Dec", "flux": "Total_flux", "id": "Source_ID",
+    },
     "racs-low2-25": {
         "basename": "RACS-low2_sources_25arcsec_patched.fits",
         "ra": "RA", "dec": "Dec", "flux": "Total_flux", "id": "Source_ID",
@@ -34,6 +38,10 @@ CATALOGUES = {
     "racs-low3-scaled": {
         "basename": "RACS-low3_sources_scaled.fits",
         "ra": "RA", "dec": "Dec", "flux": "Total_flux", "id": "Source_ID",
+    },
+    "racs-mid1": {
+        "basename": "RACS-mid_sources.fits",
+        "ra": "ra", "dec": "dec", "flux": "total_flux", "id": "source_id",
     },
     "racs-mid1-25": {
         "basename": "RACS-mid_sources_25arcsec.fits",
